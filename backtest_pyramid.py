@@ -158,15 +158,15 @@ def run_pyramid_backtest(
         if direction != '' and pyramid_positions:
             is_long = (direction == 'LONG')
             
-            # Calculate current total profit (average of all positions)
-            total_profit = 0.0
-            for pos in pyramid_positions:
-                total_profit += calculate_profit_pct(pos.entry_price, price, is_long)
-            avg_profit = total_profit / len(pyramid_positions)
+            # Calculate profit from ORIGINAL ENTRY PRICE (Option B)
+            if is_long:
+                profit_from_entry = ((price - round_entry_price) / round_entry_price) * 100
+            else:
+                profit_from_entry = ((round_entry_price - price) / round_entry_price) * 100
             
-            # Update max profit
-            if avg_profit > max_profit_pct:
-                max_profit_pct = avg_profit
+            # Update max profit (entry-relative)
+            if profit_from_entry > max_profit_pct:
+                max_profit_pct = profit_from_entry
             
             # Check for new pyramid level
             if len(pyramid_positions) < max_pyramids:
@@ -192,9 +192,9 @@ def run_pyramid_backtest(
                     if verbose:
                         print(f"[{timestamp}] PYRAMID #{len(pyramid_positions)} @ ${price:.2f} (+{move_from_ref:.1f}% from ref)")
             
-            # Check trailing stop
+            # Check trailing stop (entry-relative)
             trigger_profit = max_profit_pct - trailing_pct
-            if avg_profit <= trigger_profit:
+            if profit_from_entry <= trigger_profit:
                 # Close all pyramid positions
                 round_pnl = 0.0
                 
@@ -205,9 +205,12 @@ def run_pyramid_backtest(
                     round_pnl += pos.pnl_percent
                     total_fees += fee_pct
                 
-                # Add the losing hedge P&L
+                # Add the losing hedge P&L (includes its exit fee)
                 losing_pnl = -threshold_pct - fee_pct
                 round_pnl += losing_pnl
+                
+                # Deduct entry fees (2 positions opened at start)
+                round_pnl -= 2 * fee_pct
                 
                 total_pnl += round_pnl
                 total_rounds += 1
@@ -216,7 +219,7 @@ def run_pyramid_backtest(
                 
                 if verbose:
                     print(f"[{timestamp}] ALL CLOSED @ ${price:.2f} | Pyramids: {len(pyramid_positions)} | "
-                          f"Max: {max_profit_pct:+.2f}% | Round P&L: {round_pnl:+.2f}%")
+                          f"Max: {max_profit_pct:+.2f}% | Profit: {profit_from_entry:+.2f}% | Round P&L: {round_pnl:+.2f}%")
                 
                 # Record round
                 rounds.append(PyramidRound(
