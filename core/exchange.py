@@ -193,6 +193,28 @@ class BinanceExchange:
             print(f"⚠ Could not set hedge mode: {e}")
             return False
     
+    def set_leverage(self, symbol: str, leverage: int) -> bool:
+        """
+        Set leverage for a symbol.
+        
+        Args:
+            symbol: Trading pair
+            leverage: Leverage multiplier (1-125)
+            
+        Returns:
+            True if successful
+        """
+        try:
+            self.client.futures_change_leverage(symbol=symbol, leverage=leverage)
+            print(f"✓ Leverage set to {leverage}x for {symbol}")
+            return True
+        except Exception as e:
+            if "No need to change leverage" in str(e):
+                print(f"✓ Leverage already at {leverage}x for {symbol}")
+                return True
+            print(f"⚠ Could not set leverage: {e}")
+            return False
+    
     def open_hedged_positions(
         self, 
         symbol: Optional[str] = None, 

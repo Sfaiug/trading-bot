@@ -105,6 +105,13 @@ def parse_args():
         help="Exit threshold %% for funding rate (funding mode)"
     )
     
+    parser.add_argument(
+        "--leverage",
+        type=int,
+        default=None,
+        help="Leverage to use (1-20, default: 5)"
+    )
+    
     return parser.parse_args()
 
 
@@ -171,6 +178,28 @@ def get_int_input(prompt: str, default: str = "unlimited") -> int:
             print("Invalid number. Try again.")
 
 
+def get_leverage_input(args) -> int:
+    """Get leverage setting from args or prompt."""
+    if args.leverage:
+        return min(max(args.leverage, 1), 20)  # Clamp 1-20
+    
+    print("\nLeverage Settings:")
+    print("  Recommended: 3-5x for pyramid strategy")
+    print("  Higher = more capital efficient but riskier")
+    
+    while True:
+        value = input("Leverage (1-20) [default: 5]: ").strip()
+        if value == "":
+            return 5
+        try:
+            lev = int(value)
+            if 1 <= lev <= 20:
+                return lev
+            print("Leverage must be between 1 and 20.")
+        except ValueError:
+            print("Invalid number. Try again.")
+
+
 def configure_trading_mode(args) -> dict:
     """Configure pyramid trading parameters."""
     print("\n" + "=" * 50)
@@ -209,13 +238,14 @@ def configure_funding_mode(args) -> dict:
     }
 
 
-def confirm_settings(mode: str, symbol: str, config: dict) -> bool:
+def confirm_settings(mode: str, symbol: str, config: dict, leverage: int) -> bool:
     """Display settings and confirm."""
     print("\n" + "=" * 50)
     print("CONFIRM SETTINGS")
     print("=" * 50)
-    print(f"Mode:   {mode.upper()}")
-    print(f"Symbol: {symbol}")
+    print(f"Mode:     {mode.upper()}")
+    print(f"Symbol:   {symbol}")
+    print(f"Leverage: {leverage}x")
     
     if mode == "trading":
         print(f"Threshold:    {config['threshold']}%")
@@ -256,6 +286,9 @@ def main():
     else:
         config = configure_funding_mode(args)
     
+    # Get leverage
+    leverage = get_leverage_input(args)
+    
     # Connect to exchange
     print("\nConnecting to Binance Futures Testnet...")
     exchange = BinanceExchange()
@@ -268,6 +301,9 @@ def main():
     if not exchange.set_hedge_mode():
         print("Warning: Could not enable hedge mode.")
     
+    # Set leverage
+    exchange.set_leverage(symbol, leverage)
+    
     # Show balance
     balance = exchange.get_balance()
     print(f"\nAccount Balance:")
@@ -279,7 +315,7 @@ def main():
     print(f"\nCurrent {symbol} Price: ${price:.4f}")
     
     # Confirm settings
-    if not confirm_settings(mode, symbol, config):
+    if not confirm_settings(mode, symbol, config, leverage):
         print("\nCancelled.")
         sys.exit(0)
     
