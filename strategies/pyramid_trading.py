@@ -307,19 +307,45 @@ class PyramidTradingStrategy:
     
     def _cleanup(self):
         """Close all positions on shutdown."""
-        print("\nClosing all open positions...")
-        price = self.exchange.get_price(self.symbol)
+        print("\n\n⚠️  SHUTTING DOWN - Closing all positions...")
         
-        if self.long_pos:
-            self.exchange.close_long_hedge(self.symbol, self.position_size)
-        if self.short_pos:
-            self.exchange.close_short_hedge(self.symbol, self.position_size)
-        if self.pyramid_positions:
-            total_size = sum(p.size for p in self.pyramid_positions)
-            if self.direction == 'LONG':
-                self.exchange.close_long_hedge(self.symbol, total_size)
+        try:
+            # Close initial hedge if still open
+            if self.long_pos:
+                print(f"  Closing LONG hedge...")
+                self.exchange.close_long_hedge(self.symbol, self.position_size)
+                print(f"  ✓ LONG hedge closed")
+            
+            if self.short_pos:
+                print(f"  Closing SHORT hedge...")
+                self.exchange.close_short_hedge(self.symbol, self.position_size)
+                print(f"  ✓ SHORT hedge closed")
+            
+            # Close all pyramid positions
+            if self.pyramid_positions:
+                total_size = sum(p.size for p in self.pyramid_positions)
+                print(f"  Closing {len(self.pyramid_positions)} pyramid positions (total: {total_size})...")
+                if self.direction == 'LONG':
+                    self.exchange.close_long_hedge(self.symbol, total_size)
+                else:
+                    self.exchange.close_short_hedge(self.symbol, total_size)
+                print(f"  ✓ All pyramid positions closed")
+            
+            # Verify no positions remain
+            remaining = self.exchange.get_positions(self.symbol)
+            if remaining:
+                print(f"\n  ⚠️  Warning: {len(remaining)} positions still open!")
+                for pos in remaining:
+                    amt = float(pos['positionAmt'])
+                    if amt != 0:
+                        side = 'LONG' if amt > 0 else 'SHORT'
+                        print(f"     {side}: {abs(amt)} @ ${float(pos['entryPrice']):.4f}")
             else:
-                self.exchange.close_short_hedge(self.symbol, total_size)
+                print(f"\n  ✓ All positions successfully closed!")
+                
+        except Exception as e:
+            print(f"\n  ❌ Error during cleanup: {e}")
+            print(f"  Please manually check and close any remaining positions!")
     
     def _print_summary(self):
         """Print final summary."""
