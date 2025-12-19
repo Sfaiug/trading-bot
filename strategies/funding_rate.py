@@ -20,6 +20,7 @@ from datetime import datetime
 from typing import Optional
 
 from core.exchange import BinanceExchange
+from core.state_manager import StateManager
 from config.settings import PRICE_CHECK_INTERVAL
 
 
@@ -49,6 +50,9 @@ class FundingRateStrategy:
         self.position_size = position_size
         self.base_url = self.TESTNET_URL if use_testnet else self.MAINNET_URL
         
+        # State manager for isolated tracking
+        self.state = StateManager(mode="funding", symbol=symbol)
+        
         # State
         self.running = False
         self.position_side: Optional[str] = None  # 'LONG' or 'SHORT'
@@ -56,6 +60,7 @@ class FundingRateStrategy:
         self.entry_time: datetime = None
         self.funding_collected: float = 0.0
         self.funding_payments: int = 0
+        self.current_order_id: Optional[str] = None
     
     def run(self):
         """Main strategy loop."""
@@ -148,6 +153,7 @@ class FundingRateStrategy:
         print(f"\n{'='*60}")
         print(f"📈 ENTERING POSITION")
         print(f"{'='*60}")
+        print(f"Instance:     {self.state.instance_id}")
         print(f"Side:         {side}")
         print(f"Price:        ${price:.4f}")
         print(f"Size:         {self.position_size}")
@@ -155,19 +161,33 @@ class FundingRateStrategy:
         print(f"Expected:     {abs(funding_rate) * 3:.2f}% daily")
         print(f"{'='*60}")
         
-        # Open on exchange
-        if side == 'LONG':
-            # Open hedge and close short immediately
-            self.exchange.open_hedged_positions(self.symbol, self.position_size)
-            self.exchange.close_short_hedge(self.symbol, self.position_size)
-        else:
-            # Open hedge and close long immediately
-            self.exchange.open_hedged_positions(self.symbol, self.position_size)
-            self.exchange.close_long_hedge(self.symbol, self.position_size)
+        # Generate unique client order ID
+        client_order_id = self.state.generate_client_order_id(side)
+        
+        # Open on exchange with tracking
+        order = self.exchange.open_single_position(
+            symbol=self.symbol,
+            side=side,
+            quantity=self.position_size,
+            client_order_id=client_order_id
+        )
+        
+        # Track in state manager
+        self.state.add_order(
+            client_order_id=client_order_id,
+            exchange_order_id=order.get('orderId', 0),
+            side=side,
+            quantity=self.position_size,
+            entry_price=price
+        )
         
         self.position_side = side
         self.entry_price = price
         self.entry_time = datetime.now()
+        self.current_order_id = client_order_id
+        
+        print(f"✓ Opened {side}: {self.position_size} {self.symbol}")
+        print(f"  Order ID: {client_order_id}")
     
     def _check_exit(self, funding_rate: float, next_funding: int):
         """Check if we should exit the position."""
@@ -220,10 +240,10 @@ class FundingRateStrategy:
         # Calculate P&L
         if self.position_side == 'LONG':
             price_pnl = ((price - self.entry_price) / self.entry_price) * 100
-            self.exchange.close_long_hedge(self.symbol, self.position_size)
+            self.exchange.close_position_by_quantity(self.symbol, 'LONG', self.position_size)
         else:
             price_pnl = ((self.entry_price - price) / self.entry_price) * 100
-            self.exchange.close_short_hedge(self.symbol, self.position_size)
+            self.exchange.close_position_by_quantity(self.symbol, 'SHORT', self.position_size)
         
         total_pnl = price_pnl + self.funding_collected
         hold_time = datetime.now() - self.entry_time
@@ -231,6 +251,7 @@ class FundingRateStrategy:
         print(f"\n{'='*60}")
         print(f"📊 POSITION CLOSED")
         print(f"{'='*60}")
+        print(f"Instance:        {self.state.instance_id}")
         print(f"Entry:           ${self.entry_price:.4f}")
         print(f"Exit:            ${price:.4f}")
         print(f"Hold Time:       {hold_time}")
@@ -241,10 +262,15 @@ class FundingRateStrategy:
         print(f"TOTAL P&L:       {total_pnl:+.2f}%")
         print(f"{'='*60}")
         
+        # Remove from state manager
+        if self.current_order_id:
+            self.state.remove_order(self.current_order_id)
+        
         # Reset state
         self.position_side = None
         self.entry_price = 0.0
         self.entry_time = None
+        self.current_order_id = None
     
     def _print_status(self, funding_rate: float, next_funding: int):
         """Print current status."""
@@ -274,6 +300,11 @@ class FundingRateStrategy:
         print(f"\n{'='*60}")
         print(f"SESSION SUMMARY")
         print(f"{'='*60}")
+        print(f"Instance ID:             {self.state.instance_id}")
         print(f"Total Funding Collected: {self.funding_collected:.4f}%")
-        print(f"Total Payments: {self.funding_payments}")
+        print(f"Total Payments:          {self.funding_payments}")
         print(f"{'='*60}")
+        
+        # Cleanup state file if no positions remain
+        if not self.state.get_all_orders():
+            self.state.cleanup_state_file()

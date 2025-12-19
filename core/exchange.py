@@ -193,7 +193,14 @@ class BinanceExchange:
             print(f"⚠ Could not set hedge mode: {e}")
             return False
     
-    def open_hedged_positions(self, symbol: Optional[str] = None, quantity: float = 1, max_retries: int = 10) -> tuple:
+    def open_hedged_positions(
+        self, 
+        symbol: Optional[str] = None, 
+        quantity: float = 1, 
+        max_retries: int = 10,
+        long_client_order_id: Optional[str] = None,
+        short_client_order_id: Optional[str] = None
+    ) -> tuple:
         """
         Open both long and short positions simultaneously.
         
@@ -201,6 +208,8 @@ class BinanceExchange:
             symbol: Trading pair
             quantity: Amount for each position
             max_retries: Number of retries on failure
+            long_client_order_id: Custom ID for long order (for tracking)
+            short_client_order_id: Custom ID for short order (for tracking)
             
         Returns:
             Tuple of (long_order, short_order)
@@ -210,26 +219,36 @@ class BinanceExchange:
         
         for attempt in range(max_retries):
             try:
+                # Build long order params
+                long_params = {
+                    'symbol': symbol,
+                    'side': SIDE_BUY,
+                    'positionSide': 'LONG',
+                    'type': ORDER_TYPE_MARKET,
+                    'quantity': quantity
+                }
+                if long_client_order_id:
+                    long_params['newClientOrderId'] = long_client_order_id
+                
                 # Open long position
-                long_order = self.client.futures_create_order(
-                    symbol=symbol,
-                    side=SIDE_BUY,
-                    positionSide='LONG',
-                    type=ORDER_TYPE_MARKET,
-                    quantity=quantity
-                )
+                long_order = self.client.futures_create_order(**long_params)
                 
                 # Small delay between orders
                 time.sleep(1)
                 
+                # Build short order params
+                short_params = {
+                    'symbol': symbol,
+                    'side': SIDE_SELL,
+                    'positionSide': 'SHORT',
+                    'type': ORDER_TYPE_MARKET,
+                    'quantity': quantity
+                }
+                if short_client_order_id:
+                    short_params['newClientOrderId'] = short_client_order_id
+                
                 # Open short position
-                short_order = self.client.futures_create_order(
-                    symbol=symbol,
-                    side=SIDE_SELL,
-                    positionSide='SHORT',
-                    type=ORDER_TYPE_MARKET,
-                    quantity=quantity
-                )
+                short_order = self.client.futures_create_order(**short_params)
                 
                 price = self.get_price(symbol)
                 print(f"✓ Opened HEDGED positions: {quantity} {symbol} @ ~{price:.4f}")
@@ -287,3 +306,79 @@ class BinanceExchange:
                     time.sleep(1)
                 else:
                     raise
+    
+    def open_single_position(
+        self,
+        symbol: str,
+        side: str,
+        quantity: float,
+        client_order_id: Optional[str] = None,
+        max_retries: int = 3
+    ) -> Dict[str, Any]:
+        """
+        Open a single position (LONG or SHORT only).
+        
+        Args:
+            symbol: Trading pair
+            side: 'LONG' or 'SHORT'
+            quantity: Position size
+            client_order_id: Custom order ID for tracking
+            max_retries: Number of retries on failure
+            
+        Returns:
+            Order response from Binance
+        """
+        quantity = int(quantity)
+        
+        if side == 'LONG':
+            order_side = SIDE_BUY
+            position_side = 'LONG'
+        else:
+            order_side = SIDE_SELL
+            position_side = 'SHORT'
+        
+        for attempt in range(max_retries):
+            try:
+                params = {
+                    'symbol': symbol,
+                    'side': order_side,
+                    'positionSide': position_side,
+                    'type': ORDER_TYPE_MARKET,
+                    'quantity': quantity
+                }
+                if client_order_id:
+                    params['newClientOrderId'] = client_order_id
+                
+                order = self.client.futures_create_order(**params)
+                return order
+                
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    time.sleep(1)
+                else:
+                    raise
+    
+    def close_position_by_quantity(
+        self,
+        symbol: str,
+        side: str,
+        quantity: float,
+        max_retries: int = 3
+    ) -> Dict[str, Any]:
+        """
+        Close a position by reducing the quantity.
+        
+        Args:
+            symbol: Trading pair
+            side: 'LONG' or 'SHORT'
+            quantity: Amount to close
+            max_retries: Number of retries
+            
+        Returns:
+            Order response from Binance
+        """
+        if side == 'LONG':
+            return self.close_long_hedge(symbol, quantity, max_retries)
+        else:
+            return self.close_short_hedge(symbol, quantity, max_retries)
+
