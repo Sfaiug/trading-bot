@@ -3,164 +3,304 @@
 Automated Crypto Trading Bot
 =============================
 
-Hedge Trailing Strategy:
-- Opens simultaneous LONG and SHORT positions
-- Tracks peak (for long) and trough (for short) prices
-- Closes each position when price retraces X% from extreme
+Two Modes:
+1. PYRAMID TRADING - Hedge + Pyramid + Trailing Stop
+2. FUNDING RATE - Delta-neutral funding collection
 
 Usage:
-    # Single threshold
-    python main.py --threshold 1         # 1% trailing stop
-    python main.py --threshold 0.1       # 0.1% trailing stop (fast)
+    # Interactive mode (prompts for everything)
+    python main.py
     
-    # Multiple thresholds (run simultaneously!)
-    python main.py --thresholds 0.1,1,5  # Run all three at once
-    python main.py --thresholds 0.5,1,2,5 --rounds 10
+    # Direct mode - Pyramid Trading
+    python main.py --mode trading --symbol SOLUSDT \
+        --threshold 10 --trailing 1.5 --pyramid 2 --size 1
+    
+    # Direct mode - Funding Rate
+    python main.py --mode funding --symbol SOLUSDT \
+        --entry-funding 0.1 --exit-funding 0.02 --size 1
 """
 
 import argparse
 import sys
 
 from core.exchange import BinanceExchange
-from strategies.hedge_trailing import HedgeTrailingStrategy
-from strategies.multi_threshold import MultiThresholdStrategy
-from config.settings import DEFAULT_TRAILING_STOP_PERCENT, POSITION_SIZE, SYMBOL
+from strategies.pyramid_trading import PyramidTradingStrategy
+from strategies.funding_rate import FundingRateStrategy
+from config.settings import POSITION_SIZE, SYMBOL
+
+
+# Available coins
+COINS = ["SOLUSDT", "BTCUSDT", "ETHUSDT", "XRPUSDT", "DOGEUSDT"]
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Hedge Trailing Strategy Trading Bot",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-    # Single threshold mode
-    python main.py --threshold 1         # 1% trailing stop
-    python main.py --threshold 0.5       # 0.5% trailing stop
-    
-    # Multi-threshold mode (recommended for testing!)
-    python main.py --thresholds 0.1,1,5  # Test 3 thresholds at once
-    python main.py --thresholds 0.5,1,2  # Custom thresholds
-        """
+        description="Automated Crypto Trading Bot",
+        formatter_class=argparse.RawDescriptionHelpFormatter
     )
     
     parser.add_argument(
-        "-t", "--threshold",
-        type=float,
+        "--mode",
+        type=str,
+        choices=["trading", "funding"],
         default=None,
-        help=f"Single trailing stop percentage (default: {DEFAULT_TRAILING_STOP_PERCENT}%%)"
+        help="Trading mode: 'trading' (pyramid) or 'funding' (funding rate)"
     )
     
     parser.add_argument(
-        "-T", "--thresholds",
+        "--symbol",
         type=str,
         default=None,
-        help="Multiple trailing stop percentages, comma-separated (e.g., '0.1,1,5')"
+        help="Trading pair (e.g., SOLUSDT)"
     )
     
     parser.add_argument(
         "-s", "--size",
         type=float,
         default=POSITION_SIZE,
-        help=f"Position size per threshold in SOL (default: {POSITION_SIZE})"
+        help=f"Position size (default: {POSITION_SIZE})"
     )
     
     parser.add_argument(
         "-r", "--rounds",
         type=int,
         default=None,
-        help="Maximum rounds to run (default: unlimited)"
+        help="Maximum rounds (trading mode only)"
+    )
+    
+    # Pyramid trading args
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=None,
+        help="Threshold %% - when losing side closes (trading mode)"
     )
     
     parser.add_argument(
-        "--symbol",
-        type=str,
-        default=SYMBOL,
-        help=f"Trading pair (default: {SYMBOL})"
+        "--trailing",
+        type=float,
+        default=None,
+        help="Trailing %% - when winning side closes (trading mode)"
+    )
+    
+    parser.add_argument(
+        "--pyramid",
+        type=float,
+        default=None,
+        help="Pyramid step %% - interval to add positions (trading mode)"
+    )
+    
+    # Funding rate args
+    parser.add_argument(
+        "--entry-funding",
+        type=float,
+        default=None,
+        help="Entry threshold %% for funding rate (funding mode)"
+    )
+    
+    parser.add_argument(
+        "--exit-funding",
+        type=float,
+        default=None,
+        help="Exit threshold %% for funding rate (funding mode)"
     )
     
     return parser.parse_args()
 
 
+def print_banner():
+    print()
+    print("╔" + "═" * 58 + "╗")
+    print("║" + " AUTOMATED CRYPTO TRADING BOT ".center(58) + "║")
+    print("║" + " Binance Futures Testnet ".center(58) + "║")
+    print("╠" + "═" * 58 + "╣")
+    print("║" + " Select Mode: ".ljust(58) + "║")
+    print("║" + "   1. Pyramid Trading (hedge + pyramid + trailing) ".ljust(58) + "║")
+    print("║" + "   2. Funding Rate Farming (collect funding payments) ".ljust(58) + "║")
+    print("╚" + "═" * 58 + "╝")
+
+
+def select_mode() -> str:
+    while True:
+        choice = input("\nEnter choice [1/2]: ").strip()
+        if choice == "1":
+            return "trading"
+        elif choice == "2":
+            return "funding"
+        print("Invalid choice. Enter 1 or 2.")
+
+
+def select_coin() -> str:
+    print("\nSelect coin:")
+    for i, coin in enumerate(COINS, 1):
+        print(f"  {i}. {coin}")
+    print(f"  {len(COINS) + 1}. Custom")
+    
+    while True:
+        choice = input(f"\nEnter choice [1-{len(COINS) + 1}]: ").strip()
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(COINS):
+                return COINS[idx]
+            elif idx == len(COINS):
+                return input("Enter custom symbol (e.g., LINKUSDT): ").strip().upper()
+        except ValueError:
+            pass
+        print("Invalid choice.")
+
+
+def get_float_input(prompt: str, default: float) -> float:
+    while True:
+        value = input(f"{prompt} [default: {default}]: ").strip()
+        if value == "":
+            return default
+        try:
+            return float(value)
+        except ValueError:
+            print("Invalid number. Try again.")
+
+
+def get_int_input(prompt: str, default: str = "unlimited") -> int:
+    while True:
+        value = input(f"{prompt} [default: {default}]: ").strip()
+        if value == "":
+            return None if default == "unlimited" else int(default)
+        try:
+            return int(value)
+        except ValueError:
+            print("Invalid number. Try again.")
+
+
+def configure_trading_mode(args) -> dict:
+    """Configure pyramid trading parameters."""
+    print("\n" + "=" * 50)
+    print("PYRAMID TRADING CONFIGURATION")
+    print("=" * 50)
+    
+    threshold = args.threshold if args.threshold else get_float_input("Threshold % (losing side closes)", 1.0)
+    trailing = args.trailing if args.trailing else get_float_input("Trailing % (profit lock)", 1.0)
+    pyramid = args.pyramid if args.pyramid else get_float_input("Pyramid step %", 2.0)
+    size = args.size if args.size != POSITION_SIZE else get_float_input("Position size", POSITION_SIZE)
+    rounds = args.rounds if args.rounds else get_int_input("Max rounds", "unlimited")
+    
+    return {
+        'threshold': threshold,
+        'trailing': trailing,
+        'pyramid': pyramid,
+        'size': size,
+        'rounds': rounds
+    }
+
+
+def configure_funding_mode(args) -> dict:
+    """Configure funding rate parameters."""
+    print("\n" + "=" * 50)
+    print("FUNDING RATE CONFIGURATION")
+    print("=" * 50)
+    
+    entry = args.entry_funding if args.entry_funding else get_float_input("Entry threshold % (min funding to enter)", 0.1)
+    exit_th = args.exit_funding if args.exit_funding else get_float_input("Exit threshold % (exit when funding below)", 0.02)
+    size = args.size if args.size != POSITION_SIZE else get_float_input("Position size", POSITION_SIZE)
+    
+    return {
+        'entry_threshold': entry,
+        'exit_threshold': exit_th,
+        'size': size
+    }
+
+
+def confirm_settings(mode: str, symbol: str, config: dict) -> bool:
+    """Display settings and confirm."""
+    print("\n" + "=" * 50)
+    print("CONFIRM SETTINGS")
+    print("=" * 50)
+    print(f"Mode:   {mode.upper()}")
+    print(f"Symbol: {symbol}")
+    
+    if mode == "trading":
+        print(f"Threshold:    {config['threshold']}%")
+        print(f"Trailing:     {config['trailing']}%")
+        print(f"Pyramid Step: {config['pyramid']}%")
+        print(f"Size:         {config['size']}")
+        print(f"Max Rounds:   {config['rounds'] or 'Unlimited'}")
+    else:
+        print(f"Entry Threshold: >{config['entry_threshold']}%")
+        print(f"Exit Threshold:  <{config['exit_threshold']}%")
+        print(f"Size:            {config['size']}")
+    
+    print("=" * 50)
+    
+    confirm = input("\nStart trading? [y/n]: ").strip().lower()
+    return confirm in ['y', 'yes']
+
+
 def main():
     args = parse_args()
     
-    # Determine mode: multi-threshold or single threshold
-    if args.thresholds:
-        thresholds = [float(t.strip()) for t in args.thresholds.split(',')]
-        multi_mode = True
-    elif args.threshold:
-        thresholds = [args.threshold]
-        multi_mode = False
+    # Interactive mode selection if not provided
+    if args.mode is None:
+        print_banner()
+        mode = select_mode()
     else:
-        thresholds = [DEFAULT_TRAILING_STOP_PERCENT]
-        multi_mode = False
+        mode = args.mode
     
-    print("=" * 70)
-    print("AUTOMATED CRYPTO TRADING BOT")
-    print("Binance Futures Testnet")
-    print("=" * 70)
-    print()
+    # Symbol selection if not provided
+    if args.symbol is None:
+        symbol = select_coin()
+    else:
+        symbol = args.symbol
     
-    # Initialize exchange connection
-    print("Connecting to Binance Futures Testnet...")
+    # Mode-specific configuration
+    if mode == "trading":
+        config = configure_trading_mode(args)
+    else:
+        config = configure_funding_mode(args)
+    
+    # Connect to exchange
+    print("\nConnecting to Binance Futures Testnet...")
     exchange = BinanceExchange()
     
     if not exchange.connect():
-        print("Failed to connect to exchange. Check API keys in .env file.")
+        print("Failed to connect. Check API keys in .env file.")
         sys.exit(1)
     
-    # Enable hedge mode for simultaneous long/short
+    # Enable hedge mode
     if not exchange.set_hedge_mode():
-        print("Warning: Could not enable hedge mode. Strategy may not work correctly.")
+        print("Warning: Could not enable hedge mode.")
     
-    # Show account balance
+    # Show balance
     balance = exchange.get_balance()
     print(f"\nAccount Balance:")
     print(f"  Wallet:    ${balance['wallet_balance']:.2f} USDT")
     print(f"  Available: ${balance['available_balance']:.2f} USDT")
     
     # Show current price
-    price = exchange.get_price(args.symbol)
-    print(f"\nCurrent {args.symbol} Price: ${price:.4f}")
-    
-    # Calculate required margin
-    total_positions = len(thresholds) * 2  # LONG + SHORT per threshold
-    estimated_margin = price * args.size * len(thresholds) * 2 * 0.1  # ~10x leverage assumption
+    price = exchange.get_price(symbol)
+    print(f"\nCurrent {symbol} Price: ${price:.4f}")
     
     # Confirm settings
-    print(f"\nStrategy Settings:")
-    print(f"  Mode:       {'MULTI-THRESHOLD' if multi_mode else 'SINGLE THRESHOLD'}")
-    print(f"  Symbol:     {args.symbol}")
-    print(f"  Size:       {args.size} per threshold")
-    print(f"  Thresholds: {', '.join(f'{t}%' for t in thresholds)}")
-    print(f"  Positions:  {total_positions} total ({len(thresholds)} LONG + {len(thresholds)} SHORT)")
-    print(f"  Est. Margin: ~${estimated_margin:.2f} USDT")
-    print(f"  Rounds:     {args.rounds or 'Unlimited'}")
-    print()
+    if not confirm_settings(mode, symbol, config):
+        print("\nCancelled.")
+        sys.exit(0)
     
-    if estimated_margin > balance['available_balance']:
-        print(f"⚠️  Warning: Estimated margin (${estimated_margin:.2f}) exceeds available balance!")
-        print(f"    Consider reducing position size or number of thresholds.")
-        print()
-    
-    input("Press Enter to start trading (Ctrl+C to cancel)...")
-    
-    # Run appropriate strategy
-    if multi_mode or len(thresholds) > 1:
-        strategy = MultiThresholdStrategy(
+    # Run strategy
+    if mode == "trading":
+        strategy = PyramidTradingStrategy(
             exchange=exchange,
-            thresholds=thresholds,
-            position_size=args.size,
-            symbol=args.symbol,
-            max_rounds=args.rounds
+            symbol=symbol,
+            threshold_pct=config['threshold'],
+            trailing_pct=config['trailing'],
+            pyramid_step_pct=config['pyramid'],
+            position_size=config['size'],
+            max_rounds=config['rounds']
         )
     else:
-        strategy = HedgeTrailingStrategy(
+        strategy = FundingRateStrategy(
             exchange=exchange,
-            threshold_percent=thresholds[0],
-            position_size=args.size,
-            symbol=args.symbol,
-            max_rounds=args.rounds
+            symbol=symbol,
+            entry_threshold=config['entry_threshold'],
+            exit_threshold=config['exit_threshold'],
+            position_size=config['size']
         )
     
     strategy.run()
