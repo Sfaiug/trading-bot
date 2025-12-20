@@ -30,7 +30,7 @@ from config.settings import POSITION_SIZE, SYMBOL
 
 
 # Available coins
-COINS = ["SOLUSDT", "BTCUSDT", "ETHUSDT", "XRPUSDT", "DOGEUSDT"]
+COINS = ["SOLUSDT", "BTCUSDT", "ETHUSDT", "XLMUSDT", "XRPUSDT", "DOGEUSDT"]
 
 
 def parse_args():

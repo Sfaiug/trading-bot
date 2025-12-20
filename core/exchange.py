@@ -19,9 +19,63 @@ from config.settings import (
 class BinanceExchange:
     """Wrapper for Binance Futures Testnet API."""
     
+    # Default precision for common symbols (stepSize)
+    DEFAULT_PRECISION = {
+        'SOLUSDT': 1,      # 1 SOL
+        'BTCUSDT': 0.001,  # 0.001 BTC
+        'ETHUSDT': 0.01,   # 0.01 ETH
+        'XLMUSDT': 1,      # 1 XLM
+        'XRPUSDT': 0.1,    # 0.1 XRP
+        'DOGEUSDT': 1,     # 1 DOGE
+    }
+    
     def __init__(self):
         self.client: Optional[Client] = None
         self.symbol = SYMBOL
+        self._symbol_info_cache: Dict[str, dict] = {}
+    
+    def get_step_size(self, symbol: str) -> float:
+        """Get the quantity step size for a symbol."""
+        # Check cache first
+        if symbol in self._symbol_info_cache:
+            return self._symbol_info_cache[symbol]['step_size']
+        
+        # Use default if known
+        if symbol in self.DEFAULT_PRECISION:
+            step = self.DEFAULT_PRECISION[symbol]
+            self._symbol_info_cache[symbol] = {'step_size': step}
+            return step
+        
+        # Fetch from API
+        try:
+            info = self.client.futures_exchange_info()
+            for s in info['symbols']:
+                if s['symbol'] == symbol:
+                    for f in s['filters']:
+                        if f['filterType'] == 'LOT_SIZE':
+                            step = float(f['stepSize'])
+                            self._symbol_info_cache[symbol] = {'step_size': step}
+                            return step
+        except Exception:
+            pass
+        
+        # Default to 0.01 if unknown
+        return 0.01
+    
+    def round_quantity(self, symbol: str, quantity: float) -> float:
+        """Round quantity to valid step size for the symbol."""
+        step_size = self.get_step_size(symbol)
+        
+        # Round to step size
+        precision = len(str(step_size).rstrip('0').split('.')[-1]) if '.' in str(step_size) else 0
+        rounded = round(quantity / step_size) * step_size
+        rounded = round(rounded, precision)
+        
+        # Ensure minimum quantity
+        if rounded < step_size:
+            rounded = step_size
+        
+        return rounded
         
     def connect(self) -> bool:
         """
@@ -237,7 +291,7 @@ class BinanceExchange:
             Tuple of (long_order, short_order)
         """
         symbol = symbol or self.symbol
-        quantity = int(quantity)  # Ensure whole number for SOL on testnet
+        quantity = self.round_quantity(symbol, quantity)
         
         for attempt in range(max_retries):
             try:
@@ -290,7 +344,7 @@ class BinanceExchange:
     def close_long_hedge(self, symbol: Optional[str] = None, quantity: float = 1, max_retries: int = 3) -> Dict[str, Any]:
         """Close long position in hedge mode."""
         symbol = symbol or self.symbol
-        quantity = int(quantity)  # Ensure whole number for SOL on testnet
+        quantity = self.round_quantity(symbol, quantity)
         
         for attempt in range(max_retries):
             try:
@@ -311,7 +365,7 @@ class BinanceExchange:
     def close_short_hedge(self, symbol: Optional[str] = None, quantity: float = 1, max_retries: int = 3) -> Dict[str, Any]:
         """Close short position in hedge mode."""
         symbol = symbol or self.symbol
-        quantity = int(quantity)  # Ensure whole number for SOL on testnet
+        quantity = self.round_quantity(symbol, quantity)
         
         for attempt in range(max_retries):
             try:
@@ -350,7 +404,7 @@ class BinanceExchange:
         Returns:
             Order response from Binance
         """
-        quantity = int(quantity)
+        quantity = self.round_quantity(symbol, quantity)
         
         if side == 'LONG':
             order_side = SIDE_BUY
