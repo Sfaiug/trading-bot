@@ -21,6 +21,7 @@ from typing import Optional
 
 from core.exchange import BinanceExchange
 from core.state_manager import StateManager
+from ui.dashboard import TradingDashboard
 from config.settings import PRICE_CHECK_INTERVAL
 
 
@@ -41,7 +42,8 @@ class FundingRateStrategy:
         entry_threshold: float = 0.1,  # Enter when funding > 0.1%
         exit_threshold: float = 0.02,  # Exit when funding < 0.02%
         position_size: float = 1.0,
-        use_testnet: bool = True
+        use_testnet: bool = True,
+        dashboard: Optional[TradingDashboard] = None
     ):
         self.exchange = exchange
         self.symbol = symbol
@@ -49,6 +51,7 @@ class FundingRateStrategy:
         self.exit_threshold = exit_threshold
         self.position_size = position_size
         self.base_url = self.TESTNET_URL if use_testnet else self.MAINNET_URL
+        self.dashboard = dashboard
         
         # State manager for isolated tracking
         self.state = StateManager(mode="funding", symbol=symbol)
@@ -66,7 +69,11 @@ class FundingRateStrategy:
         """Main strategy loop."""
         self.running = True
         
-        self._print_header()
+        # Start dashboard if provided
+        if self.dashboard:
+            self.dashboard.start()
+        else:
+            self._print_header()
         
         try:
             while self.running:
@@ -74,12 +81,44 @@ class FundingRateStrategy:
                 funding_info = self._get_funding_rate()
                 
                 if funding_info is None:
-                    print("Error getting funding rate. Retrying...")
+                    if self.dashboard:
+                        self.dashboard.add_log("Error getting funding rate. Retrying...")
+                    else:
+                        print("Error getting funding rate. Retrying...")
                     time.sleep(10)
                     continue
                 
                 funding_rate = funding_info['rate']
                 next_funding = funding_info['next_time']
+                mark_price = funding_info['mark_price']
+                
+                # Calculate time until next funding
+                now = int(datetime.now().timestamp() * 1000)
+                next_mins = int((next_funding - now) / 1000 / 60)
+                
+                # Update dashboard
+                if self.dashboard:
+                    self.dashboard.set_price(mark_price)
+                    self.dashboard.set_funding_info(funding_rate, next_mins)
+                    
+                    # Update round state for display
+                    if self.position_side:
+                        self.dashboard.round.phase = "HOLDING"
+                        self.dashboard.round.direction = self.position_side
+                        self.dashboard.round.entry_price = self.entry_price
+                        if self.entry_price > 0:
+                            if self.position_side == 'LONG':
+                                pnl = ((mark_price - self.entry_price) / self.entry_price) * 100
+                            else:
+                                pnl = ((self.entry_price - mark_price) / self.entry_price) * 100
+                            self.dashboard.round.current_profit = pnl
+                        self.dashboard.funding_collected = self.funding_collected
+                        self.dashboard.funding_payments = self.funding_payments
+                    else:
+                        self.dashboard.round.phase = "WAITING"
+                        self.dashboard.round.direction = ""
+                    
+                    self.dashboard.update()
                 
                 # Manage position
                 if self.position_side is None:
@@ -87,14 +126,21 @@ class FundingRateStrategy:
                 else:
                     self._check_exit(funding_rate, next_funding)
                 
-                # Status update
-                self._print_status(funding_rate, next_funding)
+                # Status update (for non-dashboard mode)
+                if not self.dashboard:
+                    self._print_status(funding_rate, next_funding)
                 
                 time.sleep(60)  # Check every minute
                 
         except KeyboardInterrupt:
-            print("\n\n⚠ Interrupted by user")
+            if self.dashboard:
+                self.dashboard.add_log("⚠ Interrupted by user")
+            else:
+                print("\n\n⚠ Interrupted by user")
             self._close_position()
+        finally:
+            if self.dashboard:
+                self.dashboard.stop()
         
         self._print_summary()
     

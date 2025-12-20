@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Pyramid Trading Strategy - Live Trading
+Pyramid Trading Strategy - Live Trading with Dashboard
 
 Strategy Logic:
 1. Open hedge at entry price (1 LONG + 1 SHORT)
@@ -13,10 +13,11 @@ Strategy Logic:
 import time
 from datetime import datetime
 from typing import Optional, List
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from core.exchange import BinanceExchange
 from config.settings import PRICE_CHECK_INTERVAL
+from ui.dashboard import TradingDashboard
 
 
 @dataclass
@@ -31,7 +32,7 @@ class Position:
 
 class PyramidTradingStrategy:
     """
-    Live pyramid trading strategy.
+    Live pyramid trading strategy with dashboard UI.
     Opens hedge, pyramids into winning direction, trails profit.
     """
     
@@ -44,7 +45,8 @@ class PyramidTradingStrategy:
         pyramid_step_pct: float = 2.0,
         position_size: float = 1.0,
         max_pyramids: int = 10,
-        max_rounds: Optional[int] = None
+        max_rounds: Optional[int] = None,
+        dashboard: Optional[TradingDashboard] = None
     ):
         self.exchange = exchange
         self.symbol = symbol
@@ -54,11 +56,14 @@ class PyramidTradingStrategy:
         self.position_size = position_size
         self.max_pyramids = max_pyramids
         self.max_rounds = max_rounds
+        self.dashboard = dashboard
         
         # State
         self.running = False
         self.round_number = 0
         self.total_pnl = 0.0
+        self.wins = 0
+        self.losses = 0
         
         # Current round state
         self.long_pos: Position = None
@@ -74,12 +79,19 @@ class PyramidTradingStrategy:
         """Main strategy loop."""
         self.running = True
         
-        self._print_header()
+        # Start dashboard if provided
+        if self.dashboard:
+            self.dashboard.start()
+        else:
+            self._print_header()
         
         try:
             while self.running:
                 if self.max_rounds and self.round_number >= self.max_rounds:
-                    print(f"\n✓ Completed {self.max_rounds} rounds. Stopping.")
+                    if self.dashboard:
+                        self.dashboard.add_log(f"✓ Completed {self.max_rounds} rounds. Stopping.")
+                    else:
+                        print(f"\n✓ Completed {self.max_rounds} rounds. Stopping.")
                     break
                 
                 # Start new round if no positions
@@ -89,18 +101,29 @@ class PyramidTradingStrategy:
                 # Get current price
                 price = self.exchange.get_price(self.symbol)
                 
+                # Update dashboard
+                if self.dashboard:
+                    self.dashboard.set_price(price)
+                
                 # Process price update
                 self._process_price(price)
                 
                 time.sleep(PRICE_CHECK_INTERVAL)
                 
         except KeyboardInterrupt:
-            print("\n\n⚠ Interrupted by user")
+            if self.dashboard:
+                self.dashboard.add_log("⚠ Interrupted by user")
+            else:
+                print("\n\n⚠ Interrupted by user")
             self._cleanup()
+        finally:
+            if self.dashboard:
+                self.dashboard.stop()
         
         self._print_summary()
     
     def _print_header(self):
+        """Print header (fallback when no dashboard)."""
         print(f"\n{'#'*60}")
         print(f"PYRAMID TRADING STRATEGY")
         print(f"{'#'*60}")
@@ -123,9 +146,12 @@ class PyramidTradingStrategy:
         self.round_number += 1
         price = self.exchange.get_price(self.symbol)
         
-        print(f"\n{'='*60}")
-        print(f"ROUND {self.round_number} - Opening hedge @ ${price:.4f}")
-        print(f"{'='*60}")
+        if self.dashboard:
+            self.dashboard.start_round(self.round_number, price)
+        else:
+            print(f"\n{'='*60}")
+            print(f"ROUND {self.round_number} - Opening hedge @ ${price:.4f}")
+            print(f"{'='*60}")
         
         # Open positions on exchange
         self.exchange.open_hedged_positions(self.symbol, self.position_size)
@@ -135,6 +161,11 @@ class PyramidTradingStrategy:
                                   entry_time=datetime.now(), size=self.position_size)
         self.short_pos = Position(side='SHORT', entry_price=price,
                                    entry_time=datetime.now(), size=self.position_size)
+        
+        # Update dashboard
+        if self.dashboard:
+            self.dashboard.add_position("LONG", price, self.position_size, 1)
+            self.dashboard.add_position("SHORT", price, self.position_size, 1)
         
         self.round_entry_price = price
         self.direction = ''
@@ -171,7 +202,12 @@ class PyramidTradingStrategy:
             # Close LONG on exchange
             self.exchange.close_long_hedge(self.symbol, self.position_size)
             
-            print(f"\n❌ LONG CLOSED @ ${price:.4f} ({long_profit:+.2f}%) → Direction: SHORT")
+            if self.dashboard:
+                self.dashboard.set_direction('SHORT', price)
+                self.dashboard.clear_positions()
+                self.dashboard.add_position("SHORT", entry, self.position_size, 1)
+            else:
+                print(f"\n❌ LONG CLOSED @ ${price:.4f} ({long_profit:+.2f}%) → Direction: SHORT")
             
             # SHORT becomes first pyramid position
             self.pyramid_positions = [self.short_pos]
@@ -187,7 +223,12 @@ class PyramidTradingStrategy:
             # Close SHORT on exchange
             self.exchange.close_short_hedge(self.symbol, self.position_size)
             
-            print(f"\n❌ SHORT CLOSED @ ${price:.4f} ({short_profit:+.2f}%) → Direction: LONG")
+            if self.dashboard:
+                self.dashboard.set_direction('LONG', price)
+                self.dashboard.clear_positions()
+                self.dashboard.add_position("LONG", entry, self.position_size, 1)
+            else:
+                print(f"\n❌ SHORT CLOSED @ ${price:.4f} ({short_profit:+.2f}%) → Direction: LONG")
             
             # LONG becomes first pyramid position
             self.pyramid_positions = [self.long_pos]
@@ -196,8 +237,13 @@ class PyramidTradingStrategy:
             self.max_profit_pct = long_profit
         
         else:
-            # Still waiting for direction
-            self._print_status(price, long_profit, short_profit)
+            # Still waiting for direction - update dashboard
+            if self.dashboard:
+                # Just update price, dashboard handles display
+                pass
+            else:
+                print(f"\r  ${price:.4f} | LONG: {long_profit:+.2f}% | SHORT: {short_profit:+.2f}% | Waiting for direction...    ", 
+                      end="", flush=True)
     
     def _manage_pyramid(self, price: float):
         """Manage pyramid positions - add new ones, check trailing stop."""
@@ -213,6 +259,13 @@ class PyramidTradingStrategy:
         if profit_from_entry > self.max_profit_pct:
             self.max_profit_pct = profit_from_entry
         
+        # Calculate trigger
+        trigger_profit = self.max_profit_pct - self.trailing_pct
+        
+        # Update dashboard
+        if self.dashboard:
+            self.dashboard.set_profits(profit_from_entry, self.max_profit_pct, trigger_profit)
+        
         # Check for new pyramid level
         if len(self.pyramid_positions) < self.max_pyramids:
             if is_long:
@@ -225,22 +278,20 @@ class PyramidTradingStrategy:
                 self._add_pyramid(price, move_from_ref)
         
         # Check trailing stop
-        trigger_profit = self.max_profit_pct - self.trailing_pct
         if profit_from_entry <= trigger_profit:
             self._close_all(price, profit_from_entry)
         else:
-            self._print_pyramid_status(price, profit_from_entry)
+            if not self.dashboard:
+                self._print_pyramid_status(price, profit_from_entry)
     
     def _add_pyramid(self, price: float, move_from_ref: float):
         """Add a new pyramid position."""
         # Open on exchange
         if self.direction == 'LONG':
             self.exchange.open_hedged_positions(self.symbol, self.position_size)
-            # Close the short side immediately (we only want long)
             self.exchange.close_short_hedge(self.symbol, self.position_size)
         else:
             self.exchange.open_hedged_positions(self.symbol, self.position_size)
-            # Close the long side immediately (we only want short)
             self.exchange.close_long_hedge(self.symbol, self.position_size)
         
         new_pos = Position(
@@ -252,7 +303,13 @@ class PyramidTradingStrategy:
         self.pyramid_positions.append(new_pos)
         self.next_pyramid_level += 1
         
-        print(f"\n📈 PYRAMID #{len(self.pyramid_positions)} @ ${price:.4f} (+{move_from_ref:.1f}% from ref)")
+        pyramid_num = len(self.pyramid_positions)
+        
+        if self.dashboard:
+            self.dashboard.add_pyramid(price, pyramid_num)
+            self.dashboard.add_position(self.direction, price, self.position_size, pyramid_num)
+        else:
+            print(f"\n📈 PYRAMID #{pyramid_num} @ ${price:.4f} (+{move_from_ref:.1f}% from ref)")
     
     def _close_all(self, price: float, profit_from_entry: float):
         """Close all pyramid positions."""
@@ -279,26 +336,30 @@ class PyramidTradingStrategy:
         round_pnl -= self.threshold_pct
         
         self.total_pnl += round_pnl
+        is_win = round_pnl > 0
+        if is_win:
+            self.wins += 1
+        else:
+            self.losses += 1
         
-        emoji = "✅" if round_pnl > 0 else "❌"
-        print(f"\n{emoji} ALL CLOSED @ ${price:.4f}")
-        print(f"   Pyramids: {len(self.pyramid_positions)}")
-        print(f"   Max Profit: {self.max_profit_pct:+.2f}%")
-        print(f"   Exit Profit: {profit_from_entry:+.2f}%")
-        print(f"   Round P&L: {round_pnl:+.2f}%")
-        print(f"   Total P&L: {self.total_pnl:+.2f}%")
+        if self.dashboard:
+            self.dashboard.end_round(round_pnl, is_win)
+            self.dashboard.clear_positions()
+        else:
+            emoji = "✅" if is_win else "❌"
+            print(f"\n{emoji} ALL CLOSED @ ${price:.4f}")
+            print(f"   Pyramids: {len(self.pyramid_positions)}")
+            print(f"   Max Profit: {self.max_profit_pct:+.2f}%")
+            print(f"   Exit Profit: {profit_from_entry:+.2f}%")
+            print(f"   Round P&L: {round_pnl:+.2f}%")
+            print(f"   Total P&L: {self.total_pnl:+.2f}%")
         
         # Reset
         self.pyramid_positions = []
         self.direction = ''
     
-    def _print_status(self, price: float, long_profit: float, short_profit: float):
-        """Print hedge status."""
-        print(f"\r  ${price:.4f} | LONG: {long_profit:+.2f}% | SHORT: {short_profit:+.2f}% | Waiting for direction...    ", 
-              end="", flush=True)
-    
     def _print_pyramid_status(self, price: float, profit_from_entry: float):
-        """Print pyramid status."""
+        """Print pyramid status (fallback when no dashboard)."""
         trigger = self.max_profit_pct - self.trailing_pct
         print(f"\r  ${price:.4f} | {self.direction} x{len(self.pyramid_positions)} | "
               f"Profit: {profit_from_entry:+.2f}% | Max: {self.max_profit_pct:+.2f}% | "
@@ -307,51 +368,37 @@ class PyramidTradingStrategy:
     
     def _cleanup(self):
         """Close all positions on shutdown."""
-        print("\n\n⚠️  SHUTTING DOWN - Closing all positions...")
+        if self.dashboard:
+            self.dashboard.add_log("Closing all positions...")
+        else:
+            print("\n\n⚠️  SHUTTING DOWN - Closing all positions...")
         
         try:
-            # Close initial hedge if still open
             if self.long_pos:
-                print(f"  Closing LONG hedge...")
                 self.exchange.close_long_hedge(self.symbol, self.position_size)
-                print(f"  ✓ LONG hedge closed")
-            
             if self.short_pos:
-                print(f"  Closing SHORT hedge...")
                 self.exchange.close_short_hedge(self.symbol, self.position_size)
-                print(f"  ✓ SHORT hedge closed")
-            
-            # Close all pyramid positions
             if self.pyramid_positions:
                 total_size = sum(p.size for p in self.pyramid_positions)
-                print(f"  Closing {len(self.pyramid_positions)} pyramid positions (total: {total_size})...")
                 if self.direction == 'LONG':
                     self.exchange.close_long_hedge(self.symbol, total_size)
                 else:
                     self.exchange.close_short_hedge(self.symbol, total_size)
-                print(f"  ✓ All pyramid positions closed")
             
-            # Verify no positions remain
-            remaining = self.exchange.get_positions(self.symbol)
-            if remaining:
-                print(f"\n  ⚠️  Warning: {len(remaining)} positions still open!")
-                for pos in remaining:
-                    amt = float(pos['positionAmt'])
-                    if amt != 0:
-                        side = 'LONG' if amt > 0 else 'SHORT'
-                        print(f"     {side}: {abs(amt)} @ ${float(pos['entryPrice']):.4f}")
-            else:
-                print(f"\n  ✓ All positions successfully closed!")
-                
+            if self.dashboard:
+                self.dashboard.add_log("✓ All positions closed")
         except Exception as e:
-            print(f"\n  ❌ Error during cleanup: {e}")
-            print(f"  Please manually check and close any remaining positions!")
+            if self.dashboard:
+                self.dashboard.add_log(f"❌ Cleanup error: {e}")
     
     def _print_summary(self):
         """Print final summary."""
-        print(f"\n{'='*60}")
-        print(f"SESSION SUMMARY")
-        print(f"{'='*60}")
-        print(f"Rounds Completed: {self.round_number}")
-        print(f"Total P&L: {self.total_pnl:+.2f}%")
-        print(f"{'='*60}")
+        if not self.dashboard:
+            print(f"\n{'='*60}")
+            print(f"SESSION SUMMARY")
+            print(f"{'='*60}")
+            print(f"Rounds Completed: {self.round_number}")
+            print(f"Wins: {self.wins}")
+            print(f"Losses: {self.losses}")
+            print(f"Total P&L: {self.total_pnl:+.2f}%")
+            print(f"{'='*60}")

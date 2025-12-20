@@ -26,6 +26,7 @@ import sys
 from core.exchange import BinanceExchange
 from strategies.pyramid_trading import PyramidTradingStrategy
 from strategies.funding_rate import FundingRateStrategy
+from ui.dashboard import TradingDashboard
 from config.settings import POSITION_SIZE, SYMBOL
 
 
@@ -361,7 +362,33 @@ def main():
         print("\nCancelled.")
         sys.exit(0)
     
-    # Run strategy
+    # Create dashboard
+    balance = exchange.get_balance()
+    if mode == "trading":
+        dashboard = TradingDashboard(
+            mode=mode,
+            symbol=symbol,
+            leverage=leverage,
+            dollar_amount=dollar_amount,
+            threshold_pct=config['threshold'],
+            trailing_pct=config['trailing'],
+            pyramid_step_pct=config['pyramid']
+        )
+    else:
+        dashboard = TradingDashboard(
+            mode=mode,
+            symbol=symbol,
+            leverage=leverage,
+            dollar_amount=dollar_amount,
+            entry_threshold=config['entry_threshold'],
+            exit_threshold=config['exit_threshold']
+        )
+    
+    # Set initial state
+    dashboard.set_balance(balance['wallet_balance'], balance['available_balance'])
+    dashboard.set_price(price)
+    
+    # Run strategy with dashboard
     if mode == "trading":
         strategy = PyramidTradingStrategy(
             exchange=exchange,
@@ -370,7 +397,8 @@ def main():
             trailing_pct=config['trailing'],
             pyramid_step_pct=config['pyramid'],
             position_size=quantity,
-            max_rounds=config['rounds']
+            max_rounds=config['rounds'],
+            dashboard=dashboard
         )
     else:
         strategy = FundingRateStrategy(
@@ -378,7 +406,8 @@ def main():
             symbol=symbol,
             entry_threshold=config['entry_threshold'],
             exit_threshold=config['exit_threshold'],
-            position_size=quantity
+            position_size=quantity,
+            dashboard=dashboard
         )
     
     strategy.run()
