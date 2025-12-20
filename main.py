@@ -209,14 +209,31 @@ def configure_trading_mode(args) -> dict:
     threshold = args.threshold if args.threshold else get_float_input("Threshold % (losing side closes)", 1.0)
     trailing = args.trailing if args.trailing else get_float_input("Trailing % (profit lock)", 1.0)
     pyramid = args.pyramid if args.pyramid else get_float_input("Pyramid step %", 2.0)
-    size = args.size if args.size != POSITION_SIZE else get_float_input("Position size", POSITION_SIZE)
+    
+    # Ask for dollar amount instead of position size
+    print("\nPosition Size:")
+    print("  Enter the dollar value per position (minimum $5)")
+    while True:
+        dollar_input = input("Dollar amount per position [default: $10]: ").strip().replace('$', '')
+        if dollar_input == "":
+            dollar_amount = 10.0
+            break
+        try:
+            dollar_amount = float(dollar_input)
+            if dollar_amount < 5:
+                print("  Minimum is $5. Try again.")
+                continue
+            break
+        except ValueError:
+            print("  Invalid number. Try again.")
+    
     rounds = args.rounds if args.rounds else get_int_input("Max rounds", "unlimited")
     
     return {
         'threshold': threshold,
         'trailing': trailing,
         'pyramid': pyramid,
-        'size': size,
+        'dollar_amount': dollar_amount,
         'rounds': rounds
     }
 
@@ -229,16 +246,32 @@ def configure_funding_mode(args) -> dict:
     
     entry = args.entry_funding if args.entry_funding else get_float_input("Entry threshold % (min funding to enter)", 0.1)
     exit_th = args.exit_funding if args.exit_funding else get_float_input("Exit threshold % (exit when funding below)", 0.02)
-    size = args.size if args.size != POSITION_SIZE else get_float_input("Position size", POSITION_SIZE)
+    
+    # Ask for dollar amount instead of position size
+    print("\nPosition Size:")
+    print("  Enter the dollar value per position (minimum $5)")
+    while True:
+        dollar_input = input("Dollar amount per position [default: $10]: ").strip().replace('$', '')
+        if dollar_input == "":
+            dollar_amount = 10.0
+            break
+        try:
+            dollar_amount = float(dollar_input)
+            if dollar_amount < 5:
+                print("  Minimum is $5. Try again.")
+                continue
+            break
+        except ValueError:
+            print("  Invalid number. Try again.")
     
     return {
         'entry_threshold': entry,
         'exit_threshold': exit_th,
-        'size': size
+        'dollar_amount': dollar_amount
     }
 
 
-def confirm_settings(mode: str, symbol: str, config: dict, leverage: int) -> bool:
+def confirm_settings(mode: str, symbol: str, config: dict, leverage: int, price: float, quantity: float) -> bool:
     """Display settings and confirm."""
     print("\n" + "=" * 50)
     print("CONFIRM SETTINGS")
@@ -251,12 +284,12 @@ def confirm_settings(mode: str, symbol: str, config: dict, leverage: int) -> boo
         print(f"Threshold:    {config['threshold']}%")
         print(f"Trailing:     {config['trailing']}%")
         print(f"Pyramid Step: {config['pyramid']}%")
-        print(f"Size:         {config['size']}")
+        print(f"Position:     ${config['dollar_amount']:.2f} = {quantity} {symbol[:3]}")
         print(f"Max Rounds:   {config['rounds'] or 'Unlimited'}")
     else:
         print(f"Entry Threshold: >{config['entry_threshold']}%")
         print(f"Exit Threshold:  <{config['exit_threshold']}%")
-        print(f"Size:            {config['size']}")
+        print(f"Position:        ${config['dollar_amount']:.2f} = {quantity} {symbol[:3]}")
     
     print("=" * 50)
     
@@ -310,12 +343,21 @@ def main():
     print(f"  Wallet:    ${balance['wallet_balance']:.2f} USDT")
     print(f"  Available: ${balance['available_balance']:.2f} USDT")
     
-    # Show current price
+    # Show current price and calculate quantity
     price = exchange.get_price(symbol)
     print(f"\nCurrent {symbol} Price: ${price:.4f}")
     
+    # Calculate quantity from dollar amount
+    dollar_amount = config['dollar_amount']
+    quantity = dollar_amount / price
+    quantity = exchange.round_quantity(symbol, quantity)
+    
+    # Recalculate actual dollar value after rounding
+    actual_value = quantity * price
+    print(f"Position: ${dollar_amount:.2f} → {quantity} {symbol[:3]} (actual: ${actual_value:.2f})")
+    
     # Confirm settings
-    if not confirm_settings(mode, symbol, config, leverage):
+    if not confirm_settings(mode, symbol, config, leverage, price, quantity):
         print("\nCancelled.")
         sys.exit(0)
     
@@ -327,7 +369,7 @@ def main():
             threshold_pct=config['threshold'],
             trailing_pct=config['trailing'],
             pyramid_step_pct=config['pyramid'],
-            position_size=config['size'],
+            position_size=quantity,
             max_rounds=config['rounds']
         )
     else:
@@ -336,7 +378,7 @@ def main():
             symbol=symbol,
             entry_threshold=config['entry_threshold'],
             exit_threshold=config['exit_threshold'],
-            position_size=config['size']
+            position_size=quantity
         )
     
     strategy.run()
