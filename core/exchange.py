@@ -76,6 +76,20 @@ class BinanceExchange:
             rounded = step_size
         
         return rounded
+    
+    def get_min_quantity(self, symbol: str) -> float:
+        """Get minimum quantity for a symbol based on $5 notional minimum."""
+        price = self.get_price(symbol)
+        step_size = self.get_step_size(symbol)
+        
+        # Binance minimum notional is $5
+        min_notional = 5.0
+        min_qty = min_notional / price
+        
+        # Round up to step size
+        min_qty = ((min_qty // step_size) + 1) * step_size
+        
+        return self.round_quantity(symbol, min_qty)
         
     def connect(self) -> bool:
         """
