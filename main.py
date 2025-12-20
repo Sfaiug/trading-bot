@@ -344,6 +344,26 @@ def main():
     print(f"  Wallet:    ${balance['wallet_balance']:.2f} USDT")
     print(f"  Available: ${balance['available_balance']:.2f} USDT")
     
+    # Check for existing positions on this symbol
+    existing_positions = exchange.get_positions(symbol)
+    if existing_positions:
+        print(f"\n⚠️  WARNING: Existing positions on {symbol}!")
+        for pos in existing_positions:
+            amt = float(pos['positionAmt'])
+            side = "LONG" if amt > 0 else "SHORT"
+            entry = float(pos['entryPrice'])
+            print(f"  {side}: {abs(amt)} @ ${entry:.4f}")
+        
+        close_existing = input("\nClose existing positions before starting? [y/n]: ").strip().lower()
+        if close_existing in ['y', 'yes']:
+            for pos in existing_positions:
+                amt = float(pos['positionAmt'])
+                if amt > 0:
+                    exchange.close_long_hedge(symbol, abs(amt))
+                else:
+                    exchange.close_short_hedge(symbol, abs(amt))
+            print("✓ Existing positions closed")
+    
     # Show current price and calculate quantity
     price = exchange.get_price(symbol)
     print(f"\nCurrent {symbol} Price: ${price:.4f}")
