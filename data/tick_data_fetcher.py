@@ -20,7 +20,7 @@ from typing import List, Tuple, Optional, Generator
 from dataclasses import dataclass
 
 
-CACHE_DIR = "cache/trades"
+CACHE_DIR = os.environ.get("TICK_DATA_CACHE", "cache/trades")
 BASE_URL = "https://data.binance.vision/data/futures/um/monthly/trades"
 
 
