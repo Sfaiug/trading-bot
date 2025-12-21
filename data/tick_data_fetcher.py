@@ -64,24 +64,27 @@ def get_months_in_range(years: int) -> List[Tuple[int, int]]:
     return months
 
 
-def download_month_trades(symbol: str, year: int, month: int) -> Optional[List[Trade]]:
+def download_and_aggregate_month(
+    symbol: str, 
+    year: int, 
+    month: int,
+    aggregate_seconds: float = 1.0
+) -> Optional[Tuple[List[Tuple[datetime, float]], int]]:
     """
-    Download and parse trades for a specific month.
+    Download and aggregate trades for a specific month.
+    
+    Memory-efficient: aggregates while streaming, never holds all trades.
     
     Returns:
-        List of Trade objects, or None if download failed.
+        Tuple of (aggregated_prices, trade_count), or None if download failed.
     """
-    # NOTE: We no longer cache individual month's raw trades (too large for BTC)
-    # The aggregated cache in fetch_tick_data() handles caching efficiently
-    
-    # Download from Binance Data Portal
     url = f"{BASE_URL}/{symbol}/{symbol}-trades-{year}-{month:02d}.zip"
     
     try:
         # Stream download for large files with progress
         response = requests.get(url, timeout=300, stream=True)
         if response.status_code == 404:
-            return None  # Month not available
+            return None
         response.raise_for_status()
         
         # Download with progress
@@ -99,37 +102,71 @@ def download_month_trades(symbol: str, year: int, month: int) -> Optional[List[T
                 print(f"\r    Downloading: {mb_down:.1f}/{mb_total:.1f} MB ({pct:.0f}%)    ", end="", flush=True)
         
         content = b''.join(chunks)
-        print("\r" + " " * 60 + "\r", end="", flush=True)  # Clear progress line
+        del chunks  # Free download chunks
+        print("\r" + " " * 60 + "\r", end="", flush=True)
         
-        # Extract ZIP and process line by line (memory efficient)
-        trades = []
+        # Stream through ZIP and aggregate on-the-fly
+        # Never hold more than 1 window of trades in memory
+        aggregated_prices = []
+        trade_count = 0
+        
+        # VWAP window state
+        window_start = None
+        window_volume = 0.0
+        window_value = 0.0
+        
         with zipfile.ZipFile(BytesIO(content)) as zf:
             csv_name = zf.namelist()[0]
             with zf.open(csv_name) as csv_file:
-                # Read line by line to avoid loading entire file
                 first_line = True
                 for raw_line in csv_file:
                     if first_line:
                         first_line = False
-                        continue  # Skip header
+                        continue
                     
                     try:
                         line = raw_line.decode('utf-8').strip()
                         parts = line.split(',')
                         if len(parts) >= 6:
-                            trades.append(Trade(
-                                timestamp=datetime.fromtimestamp(int(parts[4]) / 1000),
-                                price=float(parts[1]),
-                                quantity=float(parts[2]),
-                                is_buyer_maker=parts[5].strip().lower() == 'true'
-                            ))
+                            trade_count += 1
+                            ts = datetime.fromtimestamp(int(parts[4]) / 1000)
+                            price = float(parts[1])
+                            qty = float(parts[2])
+                            
+                            # Initialize window
+                            if window_start is None:
+                                window_start = ts
+                                window_volume = qty
+                                window_value = price * qty
+                                continue
+                            
+                            # Check if we should emit a completed window
+                            elapsed = (ts - window_start).total_seconds()
+                            if elapsed >= aggregate_seconds:
+                                # Emit VWAP for completed window
+                                if window_volume > 0:
+                                    vwap = window_value / window_volume
+                                    aggregated_prices.append((window_start, vwap))
+                                
+                                # Start new window
+                                window_start = ts
+                                window_volume = qty
+                                window_value = price * qty
+                            else:
+                                # Accumulate in current window
+                                window_volume += qty
+                                window_value += price * qty
                     except:
-                        continue  # Skip malformed lines
+                        continue
         
-        # DON'T cache raw trades - they're too big for BTC
-        # The aggregated cache in fetch_tick_data is sufficient
+        # Emit final window
+        if window_volume > 0 and window_start is not None:
+            vwap = window_value / window_volume
+            aggregated_prices.append((window_start, vwap))
         
-        return trades
+        del content  # Free ZIP content
+        
+        return (aggregated_prices, trade_count)
         
     except Exception as e:
         print(f"Error downloading {symbol} {year}-{month:02d}: {e}")
@@ -185,27 +222,18 @@ def fetch_tick_data(
         if verbose:
             print(f"  [{i}/{len(months)}] {year}-{month:02d}...", end=" ", flush=True)
         
-        # Download trades for this month
-        trades = download_month_trades(symbol, year, month)
+        # Download and aggregate in one pass (memory-efficient)
+        result = download_and_aggregate_month(symbol, year, month, aggregate_seconds)
         
-        if trades is None:
+        if result is None:
             if verbose:
                 print("not available")
             continue
         
-        trade_count = len(trades)
-        
-        # Aggregate immediately to save memory
-        if aggregate_seconds > 0:
-            aggregated = aggregate_trades(trades, aggregate_seconds)
-        else:
-            aggregated = [(t.timestamp, t.price) for t in trades]
+        aggregated, trade_count = result
         
         # Extend our results
         all_prices.extend(aggregated)
-        
-        # Free memory immediately
-        del trades
         
         if verbose:
             print(f"✓ {trade_count:,} trades → {len(aggregated):,} prices")
