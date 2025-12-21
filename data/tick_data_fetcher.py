@@ -71,21 +71,8 @@ def download_month_trades(symbol: str, year: int, month: int) -> Optional[List[T
     Returns:
         List of Trade objects, or None if download failed.
     """
-    cache_path = get_cache_path(symbol, year, month)
-    
-    # Check cache first
-    if os.path.exists(cache_path):
-        try:
-            with open(cache_path, 'r') as f:
-                data = json.load(f)
-            return [Trade(
-                timestamp=datetime.fromisoformat(t['ts']),
-                price=t['p'],
-                quantity=t['q'],
-                is_buyer_maker=t['m']
-            ) for t in data]
-        except Exception:
-            pass  # Cache corrupted, re-download
+    # NOTE: We no longer cache individual month's raw trades (too large for BTC)
+    # The aggregated cache in fetch_tick_data() handles caching efficiently
     
     # Download from Binance Data Portal
     url = f"{BASE_URL}/{symbol}/{symbol}-trades-{year}-{month:02d}.zip"
@@ -114,32 +101,33 @@ def download_month_trades(symbol: str, year: int, month: int) -> Optional[List[T
         content = b''.join(chunks)
         print("\r" + " " * 60 + "\r", end="", flush=True)  # Clear progress line
         
-        # Extract ZIP in memory
+        # Extract ZIP and process line by line (memory efficient)
         trades = []
         with zipfile.ZipFile(BytesIO(content)) as zf:
-            # ZIP contains single CSV file
             csv_name = zf.namelist()[0]
             with zf.open(csv_name) as csv_file:
-                # Skip header
-                lines = csv_file.read().decode('utf-8').strip().split('\n')
-                
-                for line in lines[1:]:  # Skip header
-                    parts = line.split(',')
-                    if len(parts) >= 6:
-                        # CSV format: id, price, qty, quoteQty, time, isBuyerMaker
-                        trades.append(Trade(
-                            timestamp=datetime.fromtimestamp(int(parts[4]) / 1000),
-                            price=float(parts[1]),
-                            quantity=float(parts[2]),
-                            is_buyer_maker=parts[5].strip().lower() == 'true'
-                        ))
+                # Read line by line to avoid loading entire file
+                first_line = True
+                for raw_line in csv_file:
+                    if first_line:
+                        first_line = False
+                        continue  # Skip header
+                    
+                    try:
+                        line = raw_line.decode('utf-8').strip()
+                        parts = line.split(',')
+                        if len(parts) >= 6:
+                            trades.append(Trade(
+                                timestamp=datetime.fromtimestamp(int(parts[4]) / 1000),
+                                price=float(parts[1]),
+                                quantity=float(parts[2]),
+                                is_buyer_maker=parts[5].strip().lower() == 'true'
+                            ))
+                    except:
+                        continue  # Skip malformed lines
         
-        # Cache the data (compact format)
-        ensure_cache_dir()
-        cache_data = [{'ts': t.timestamp.isoformat(), 'p': t.price, 'q': t.quantity, 'm': t.is_buyer_maker} 
-                      for t in trades]
-        with open(cache_path, 'w') as f:
-            json.dump(cache_data, f)
+        # DON'T cache raw trades - they're too big for BTC
+        # The aggregated cache in fetch_tick_data is sufficient
         
         return trades
         
@@ -156,6 +144,8 @@ def fetch_tick_data(
 ) -> List[Tuple[datetime, float]]:
     """
     Fetch tick data and aggregate to price points.
+    
+    Memory-efficient: processes each month's trades immediately and discards them.
     
     Args:
         symbol: Trading pair (e.g., "BTCUSDT")
@@ -175,10 +165,27 @@ def fetch_tick_data(
     months = get_months_in_range(years)
     all_prices = []
     
+    # Check for pre-aggregated cache first
+    agg_cache_path = os.path.join(CACHE_DIR, f"{symbol}_{years}yr_agg{int(aggregate_seconds)}s.json")
+    if os.path.exists(agg_cache_path):
+        if verbose:
+            print(f"  Loading from aggregated cache...")
+        try:
+            with open(agg_cache_path, 'r') as f:
+                data = json.load(f)
+            all_prices = [(datetime.fromisoformat(ts), p) for ts, p in data]
+            if verbose:
+                print(f"  ✓ Loaded {len(all_prices):,} prices from cache")
+                print(f"{'='*60}")
+            return all_prices
+        except Exception:
+            pass
+    
     for i, (year, month) in enumerate(months, 1):
         if verbose:
             print(f"  [{i}/{len(months)}] {year}-{month:02d}...", end=" ", flush=True)
         
+        # Download trades for this month
         trades = download_month_trades(symbol, year, month)
         
         if trades is None:
@@ -186,21 +193,38 @@ def fetch_tick_data(
                 print("not available")
             continue
         
-        # Aggregate trades to price points
-        # Use VWAP (Volume-Weighted Average Price) within each time window
+        trade_count = len(trades)
+        
+        # Aggregate immediately to save memory
         if aggregate_seconds > 0:
             aggregated = aggregate_trades(trades, aggregate_seconds)
         else:
-            # Use every trade as a price point
             aggregated = [(t.timestamp, t.price) for t in trades]
         
+        # Extend our results
         all_prices.extend(aggregated)
         
+        # Free memory immediately
+        del trades
+        
         if verbose:
-            print(f"✓ {len(trades):,} trades → {len(aggregated):,} prices")
+            print(f"✓ {trade_count:,} trades → {len(aggregated):,} prices")
     
     # Sort by timestamp
     all_prices.sort(key=lambda x: x[0])
+    
+    # Cache the aggregated result for future runs
+    if all_prices:
+        try:
+            ensure_cache_dir()
+            cache_data = [(ts.isoformat(), p) for ts, p in all_prices]
+            with open(agg_cache_path, 'w') as f:
+                json.dump(cache_data, f)
+            if verbose:
+                print(f"  ✓ Saved aggregated cache for future runs")
+        except Exception as e:
+            if verbose:
+                print(f"  (Could not save cache: {e})")
     
     if verbose:
         print(f"\n{'='*60}")
