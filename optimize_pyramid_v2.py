@@ -761,7 +761,7 @@ def main():
             with open(tick_file, 'w', newline='') as f:
                 fieldnames = ['coin', 'total_pnl_1s', 'total_pnl_tick', 'pnl_diff',
                               'rounds_1s', 'rounds_tick', 'win_rate_1s', 'win_rate_tick',
-                              'num_ticks', 'verification_time_min']
+                              'ticks_raw', 'ticks_filtered', 'tick_filter_pct', 'verification_time_sec']
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 writer.writeheader()
 
@@ -776,8 +776,10 @@ def main():
                         'rounds_tick': tick_res['total_rounds'],
                         'win_rate_1s': round(agg_res['win_rate'], 1),
                         'win_rate_tick': round(tick_res['win_rate'], 1),
-                        'num_ticks': tick_res['num_ticks'],
-                        'verification_time_min': round(tick_res['elapsed_seconds'] / 60, 1)
+                        'ticks_raw': tick_res['num_ticks_raw'],
+                        'ticks_filtered': tick_res['num_ticks_filtered'],
+                        'tick_filter_pct': args.tick_filter,
+                        'verification_time_sec': round(tick_res['elapsed_seconds'], 1)
                     })
 
             print(f"\n✓ Tick verification saved to {tick_file}")
