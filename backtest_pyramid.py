@@ -11,8 +11,10 @@ Strategy Logic:
 """
 
 from datetime import datetime
-from typing import List, Tuple, Dict, Iterator, Union, Iterable
+from typing import List, Tuple, Dict, Iterator, Union, Iterable, Optional
 from dataclasses import dataclass, field
+from collections import deque
+import statistics
 
 
 @dataclass
@@ -50,6 +52,62 @@ def calculate_profit_pct(entry_price: float, current_price: float, is_long: bool
         return ((entry_price - current_price) / entry_price) * 100
 
 
+def _calculate_pyramid_size(level: int, schedule: str) -> float:
+    """
+    Calculate position size based on pyramid level and schedule.
+
+    Args:
+        level: Pyramid level (1-based)
+        schedule: 'fixed', 'linear_decay', or 'exp_decay'
+
+    Returns:
+        Position size multiplier
+    """
+    if schedule == 'fixed':
+        return 1.0
+    elif schedule == 'linear_decay':
+        # Size decreases linearly: 1.0, 0.8, 0.6, 0.4, 0.2 (min 0.2)
+        return max(1.0 - (level - 1) * 0.2, 0.2)
+    elif schedule == 'exp_decay':
+        # Size decreases exponentially: 1.0, 0.7, 0.49, 0.34...
+        return 0.7 ** (level - 1)
+    return 1.0
+
+
+def _calculate_volatility(prices: deque, method: str) -> float:
+    """
+    Calculate volatility from recent prices.
+
+    Args:
+        prices: Recent price history
+        method: 'none', 'stddev', or 'range'
+
+    Returns:
+        Volatility measure (higher = more volatile)
+    """
+    if method == 'none' or len(prices) < 10:
+        return float('inf')  # Always pass filter
+
+    prices_list = list(prices)
+
+    if method == 'stddev':
+        # Standard deviation of returns
+        returns = [
+            (prices_list[i] - prices_list[i-1]) / prices_list[i-1] * 100
+            for i in range(1, len(prices_list))
+        ]
+        return statistics.stdev(returns) if len(returns) > 1 else 0.0
+
+    elif method == 'range':
+        # Range as % of mean
+        min_price = min(prices_list)
+        max_price = max(prices_list)
+        avg_price = sum(prices_list) / len(prices_list)
+        return ((max_price - min_price) / avg_price) * 100
+
+    return float('inf')
+
+
 def run_pyramid_backtest(
     prices: Iterable[Tuple[datetime, float]],
     threshold_pct: float,
@@ -57,7 +115,15 @@ def run_pyramid_backtest(
     pyramid_step_pct: float,
     fee_pct: float = 0.04,
     max_pyramids: int = 20,
-    verbose: bool = False
+    verbose: bool = False,
+    # NEW PARAMETERS:
+    pyramid_size_schedule: str = 'fixed',
+    min_pyramid_spacing_pct: float = 0.0,
+    pyramid_acceleration: float = 1.0,
+    time_decay_exit_seconds: Optional[float] = None,
+    volatility_filter_type: str = 'none',
+    volatility_min_pct: float = 0.0,
+    volatility_window_size: int = 100
 ) -> Dict:
     """
     Run pyramid strategy backtest.
@@ -70,12 +136,21 @@ def run_pyramid_backtest(
         fee_pct: Trading fee per trade
         max_pyramids: Maximum number of pyramid positions
         verbose: Print detailed output
-        
+
+        # NEW PARAMETERS:
+        pyramid_size_schedule: Position sizing ('fixed', 'linear_decay', 'exp_decay')
+        min_pyramid_spacing_pct: Minimum % between pyramid entries (0 = disabled)
+        pyramid_acceleration: Pyramid spacing multiplier (1.0 = linear, >1 = exponential)
+        time_decay_exit_seconds: Force exit after N seconds (None = disabled)
+        volatility_filter_type: Volatility filter ('none', 'stddev', 'range')
+        volatility_min_pct: Minimum volatility to add pyramids (0 = disabled)
+        volatility_window_size: Number of prices for volatility calculation
+
     Returns:
         Dictionary with backtest results
     """
     rounds: List[PyramidRound] = []
-    
+
     # State tracking
     long_pos: PyramidPosition = None
     short_pos: PyramidPosition = None
@@ -86,26 +161,35 @@ def run_pyramid_backtest(
     next_pyramid_level: int = 1
     round_entry_price: float = 0.0
     round_entry_time: datetime = None
-    
+
+    # NEW: Additional state for new parameters
+    last_pyramid_price: float = 0.0  # For min_pyramid_spacing
+    round_start_time: datetime = None  # For time_decay_exit
+    recent_prices: deque = deque(maxlen=volatility_window_size)  # For volatility filter
+
     total_pnl = 0.0
     total_fees = 0.0
     total_rounds = 0
     winning_rounds = 0
     
     for timestamp, price in prices:
-        
+        # Track recent prices for volatility calculation
+        recent_prices.append(price)
+
         # === PHASE 1: Open initial hedge if no positions ===
         if long_pos is None and short_pos is None and not pyramid_positions:
             long_pos = PyramidPosition(side='LONG', entry_price=price, entry_time=timestamp)
             short_pos = PyramidPosition(side='SHORT', entry_price=price, entry_time=timestamp)
             round_entry_price = price
             round_entry_time = timestamp
+            round_start_time = timestamp  # NEW: Track for time_decay_exit
             direction = ''
             pyramid_reference = 0.0
             max_profit_pct = 0.0
             next_pyramid_level = 1
+            last_pyramid_price = 0.0  # NEW: Reset for min_pyramid_spacing
             total_fees += 2 * fee_pct  # Entry fees
-            
+
             if verbose:
                 print(f"\n[{timestamp}] OPENED HEDGE @ ${price:.2f}")
             continue
@@ -175,26 +259,67 @@ def run_pyramid_backtest(
                     move_from_ref = ((price - pyramid_reference) / pyramid_reference) * 100
                 else:
                     move_from_ref = ((pyramid_reference - price) / pyramid_reference) * 100
-                
-                # Check if we've reached next pyramid level
-                pyramid_threshold = next_pyramid_level * pyramid_step_pct
-                if move_from_ref >= pyramid_threshold:
-                    # Add new pyramid position
-                    new_pos = PyramidPosition(
-                        side=direction,
-                        entry_price=price,
-                        entry_time=timestamp
+
+                # Calculate pyramid threshold with acceleration
+                if pyramid_acceleration == 1.0:
+                    # Linear spacing (original behavior)
+                    pyramid_threshold = next_pyramid_level * pyramid_step_pct
+                else:
+                    # Exponential spacing: sum of geometric series
+                    pyramid_threshold = pyramid_step_pct * sum(
+                        pyramid_acceleration ** i for i in range(next_pyramid_level)
                     )
-                    pyramid_positions.append(new_pos)
-                    total_fees += fee_pct
-                    next_pyramid_level += 1
-                    
-                    if verbose:
-                        print(f"[{timestamp}] PYRAMID #{len(pyramid_positions)} @ ${price:.2f} (+{move_from_ref:.1f}% from ref)")
+
+                # Check if we've reached next pyramid level
+                if move_from_ref >= pyramid_threshold:
+                    # NEW: Check minimum spacing from last pyramid
+                    spacing_ok = True
+                    if last_pyramid_price > 0 and min_pyramid_spacing_pct > 0:
+                        if is_long:
+                            spacing = ((price - last_pyramid_price) / last_pyramid_price) * 100
+                        else:
+                            spacing = ((last_pyramid_price - price) / last_pyramid_price) * 100
+                        spacing_ok = spacing >= min_pyramid_spacing_pct
+
+                    # NEW: Check volatility filter
+                    current_vol = _calculate_volatility(recent_prices, volatility_filter_type)
+                    volatility_ok = current_vol >= volatility_min_pct
+
+                    if spacing_ok and volatility_ok:
+                        # Add new pyramid position with calculated size
+                        pyramid_level = len(pyramid_positions) + 1
+                        pos_size = _calculate_pyramid_size(pyramid_level, pyramid_size_schedule)
+
+                        new_pos = PyramidPosition(
+                            side=direction,
+                            entry_price=price,
+                            entry_time=timestamp,
+                            size=pos_size
+                        )
+                        pyramid_positions.append(new_pos)
+                        last_pyramid_price = price  # Track for spacing check
+                        total_fees += fee_pct
+                        next_pyramid_level += 1
+
+                        if verbose:
+                            print(f"[{timestamp}] PYRAMID #{len(pyramid_positions)} @ ${price:.2f} "
+                                  f"(+{move_from_ref:.1f}% from ref, size={pos_size:.2f})")
+                    elif verbose and not spacing_ok:
+                        print(f"[{timestamp}] PYRAMID SKIPPED (spacing {spacing:.2f}% < min {min_pyramid_spacing_pct}%)")
+                    elif verbose and not volatility_ok:
+                        print(f"[{timestamp}] PYRAMID SKIPPED (vol {current_vol:.2f}% < min {volatility_min_pct}%)")
             
+            # Check time-based exit (NEW)
+            time_exit = False
+            if time_decay_exit_seconds is not None and round_start_time is not None:
+                time_elapsed = (timestamp - round_start_time).total_seconds()
+                time_exit = time_elapsed >= time_decay_exit_seconds
+
             # Check trailing stop (entry-relative)
             trigger_profit = max_profit_pct - trailing_pct
-            if profit_from_entry <= trigger_profit:
+            trail_exit = profit_from_entry <= trigger_profit
+
+            if time_exit or trail_exit:
                 # Close all pyramid positions
                 round_pnl = 0.0
                 
@@ -218,9 +343,10 @@ def run_pyramid_backtest(
                     winning_rounds += 1
                 
                 if verbose:
-                    print(f"[{timestamp}] ALL CLOSED @ ${price:.2f} | Pyramids: {len(pyramid_positions)} | "
+                    exit_reason = "TIME DECAY" if time_exit else "TRAILING STOP"
+                    print(f"[{timestamp}] {exit_reason} @ ${price:.2f} | Pyramids: {len(pyramid_positions)} | "
                           f"Max: {max_profit_pct:+.2f}% | Profit: {profit_from_entry:+.2f}% | Round P&L: {round_pnl:+.2f}%")
-                
+
                 # Record round
                 rounds.append(PyramidRound(
                     entry_price=round_entry_price,
@@ -234,13 +360,14 @@ def run_pyramid_backtest(
                     total_pnl=round_pnl,
                     num_pyramids=len(pyramid_positions)
                 ))
-                
+
                 # Reset for next round
                 pyramid_positions = []
                 direction = ''
                 pyramid_reference = 0.0
                 max_profit_pct = 0.0
                 next_pyramid_level = 1
+                last_pyramid_price = 0.0  # NEW: Reset for min_pyramid_spacing
     
     # Calculate statistics
     if total_rounds == 0:

@@ -49,23 +49,45 @@ from analytics import (
 # Configuration
 DEFAULT_COINS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "XLMUSDT"]
 
-# Grid parameters - FULL
+# Grid parameters - FULL (Original 5)
 THRESHOLDS = [float(i) for i in range(1, 21)]  # 1-20%
 TRAILINGS = [1.0 + 0.2 * i for i in range(21)]  # 1-5% in 0.2 steps
 PYRAMID_STEPS = [1.0 + 0.2 * i for i in range(11)]  # 1-3% in 0.2 steps
 MAX_PYRAMIDS = [5, 10, 20, 40, 80, 160, 320, 640, 9999]  # 9999 = unlimited
 POLL_INTERVALS = [0, 0.1, 0.2, 0.4, 0.8, 1.6, 3.2, 6.4]  # 0 = tick-by-tick (live)
 
-# Grid parameters - QUICK TEST
+# Grid parameters - NEW 7 PARAMETERS
+SIZE_SCHEDULES = ['fixed', 'linear_decay', 'exp_decay']
+ACCELERATIONS = [1.0, 1.2, 1.5]
+MIN_SPACINGS = [0.0, 1.0, 2.0]
+TIME_DECAYS = [None, 300, 900]  # None = disabled, seconds otherwise
+VOL_TYPES = ['none', 'stddev', 'range']
+VOL_MINS = [0.0, 0.5, 1.0]
+VOL_WINDOWS = [50, 100, 200]
+
+# Grid parameters - QUICK TEST (Original 5)
 THRESHOLDS_QUICK = [1, 3, 5, 10, 15]
 TRAILINGS_QUICK = [1.0, 2.0, 3.0, 4.0]
 PYRAMID_STEPS_QUICK = [1.0, 2.0, 3.0]
 MAX_PYRAMIDS_QUICK = [10, 40, 160]
-POLL_INTERVALS_QUICK = [0, 0.4, 1.6, 6.4]  # Subset for quick testing
+POLL_INTERVALS_QUICK = [0, 0.4, 1.6, 6.4]
+
+# Grid parameters - QUICK TEST (New 7)
+SIZE_SCHEDULES_QUICK = ['fixed', 'linear_decay']
+ACCELERATIONS_QUICK = [1.0, 1.3]
+MIN_SPACINGS_QUICK = [0.0, 1.0]
+TIME_DECAYS_QUICK = [None, 600]
+VOL_TYPES_QUICK = ['none', 'stddev']
+VOL_MINS_QUICK = [0.0, 0.5]
+VOL_WINDOWS_QUICK = [100]
 
 TOP_N = 10
 REFINED_COMBOS = 500
 LOG_DIR = "logs"
+
+# Convergence settings
+MAX_CONVERGENCE_ROUNDS = 10
+CONVERGENCE_THRESHOLD = 0.1  # Stop when improvement < 0.1%
 
 
 @dataclass
@@ -99,14 +121,10 @@ def rounds_to_summaries(rounds: List[PyramidRound]) -> List[RoundSummary]:
 def run_grid_search(
     coin: str,
     tick_streamer: Callable,
-    thresholds: List[float],
-    trailings: List[float],
-    pyramid_steps: List[float],
-    max_pyramids_list: List[int],
-    poll_intervals: List[float]
+    param_grid: Dict[str, List]
 ) -> Tuple[str, List[Dict]]:
     """
-    Run grid search over all parameter combinations including poll intervals.
+    Run grid search over all parameter combinations.
 
     Memory-efficient: streams prices from disk for each backtest,
     only keeps top N results in memory.
@@ -114,25 +132,44 @@ def run_grid_search(
     Args:
         coin: Trading pair symbol
         tick_streamer: Callable that returns a generator of (timestamp, price) tick data
-        thresholds: List of threshold percentages to test
-        trailings: List of trailing stop percentages to test
-        pyramid_steps: List of pyramid step percentages to test
-        max_pyramids_list: List of max pyramid counts to test
-        poll_intervals: List of polling intervals in seconds (0 = tick-by-tick)
+        param_grid: Dictionary of parameter names to lists of values to test
 
     Returns:
         Tuple of (log_file_path, top_10_results)
     """
-    total = len(thresholds) * len(trailings) * len(pyramid_steps) * len(max_pyramids_list) * len(poll_intervals)
+    # Extract parameter lists
+    thresholds = param_grid.get('threshold', [5.0])
+    trailings = param_grid.get('trailing', [2.0])
+    pyramid_steps = param_grid.get('pyramid_step', [2.0])
+    max_pyramids_list = param_grid.get('max_pyramids', [20])
+    poll_intervals = param_grid.get('poll_interval', [1.0])
+    size_schedules = param_grid.get('size_schedule', ['fixed'])
+    accelerations = param_grid.get('acceleration', [1.0])
+    min_spacings = param_grid.get('min_spacing', [0.0])
+    time_decays = param_grid.get('time_decay', [None])
+    vol_types = param_grid.get('vol_type', ['none'])
+    vol_mins = param_grid.get('vol_min', [0.0])
+    vol_windows = param_grid.get('vol_window', [100])
+
+    # Calculate total combinations
+    total = (len(thresholds) * len(trailings) * len(pyramid_steps) *
+             len(max_pyramids_list) * len(poll_intervals) * len(size_schedules) *
+             len(accelerations) * len(min_spacings) * len(time_decays) *
+             len(vol_types) * len(vol_mins) * len(vol_windows))
+
     top_results = []  # Only keep top N in memory
 
-    log_file = os.path.join(LOG_DIR, f"{coin}_pyramid_v2_grid.csv")
+    log_file = os.path.join(LOG_DIR, f"{coin}_pyramid_v3_grid.csv")
+
+    fieldnames = [
+        'threshold', 'trailing', 'pyramid_step', 'max_pyramids', 'poll_interval',
+        'size_schedule', 'acceleration', 'min_spacing', 'time_decay',
+        'vol_type', 'vol_min', 'vol_window',
+        'total_pnl', 'rounds', 'avg_pnl', 'win_rate', 'avg_pyramids'
+    ]
 
     with open(log_file, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=[
-            'threshold', 'trailing', 'pyramid_step', 'max_pyramids', 'poll_interval',
-            'total_pnl', 'rounds', 'avg_pnl', 'win_rate', 'avg_pyramids'
-        ])
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
 
         completed = 0
@@ -140,67 +177,90 @@ def run_grid_search(
 
         for poll_interval in poll_intervals:
             poll_label = "tick" if poll_interval == 0 else f"{poll_interval}s"
-            print(f"\n  Testing poll interval: {poll_label}")
 
-            for threshold in thresholds:
-                for trailing in trailings:
-                    for pyramid_step in pyramid_steps:
-                        for max_pyr in max_pyramids_list:
-                            completed += 1
+            for size_sched in size_schedules:
+                for accel in accelerations:
+                    for min_space in min_spacings:
+                        for time_decay in time_decays:
+                            for vol_type in vol_types:
+                                for vol_min in vol_mins:
+                                    for vol_win in vol_windows:
+                                        for threshold in thresholds:
+                                            for trailing in trailings:
+                                                for pyramid_step in pyramid_steps:
+                                                    for max_pyr in max_pyramids_list:
+                                                        completed += 1
 
-                            elapsed = time.time() - start
-                            rate = completed / elapsed if elapsed > 0 else 1
-                            remaining = (total - completed) / rate
+                                                        elapsed = time.time() - start
+                                                        rate = completed / elapsed if elapsed > 0 else 1
+                                                        remaining = (total - completed) / rate
 
-                            if completed % 100 == 0 or completed == 1:
-                                pct = (completed / total) * 100
-                                print(f"\r    [{completed:,}/{total:,}] {pct:.1f}% | {remaining/3600:.1f}h remaining    ",
-                                      end="", flush=True)
+                                                        if completed % 500 == 0 or completed == 1:
+                                                            pct = (completed / total) * 100
+                                                            print(f"\r    [{completed:,}/{total:,}] {pct:.1f}% | "
+                                                                  f"{remaining/3600:.1f}h remaining    ",
+                                                                  end="", flush=True)
 
-                            try:
-                                # Aggregate tick data to the poll interval
-                                price_stream = aggregate_ticks_to_interval(
-                                    tick_streamer,
-                                    poll_interval
-                                )
+                                                        try:
+                                                            # Aggregate tick data to the poll interval
+                                                            price_stream = aggregate_ticks_to_interval(
+                                                                tick_streamer,
+                                                                poll_interval
+                                                            )
 
-                                # Run backtest on aggregated stream
-                                result = run_pyramid_backtest(
-                                    price_stream,
-                                    threshold_pct=threshold,
-                                    trailing_pct=trailing,
-                                    pyramid_step_pct=pyramid_step,
-                                    max_pyramids=max_pyr,
-                                    verbose=False
-                                )
+                                                            # Run backtest with all parameters
+                                                            result = run_pyramid_backtest(
+                                                                price_stream,
+                                                                threshold_pct=threshold,
+                                                                trailing_pct=trailing,
+                                                                pyramid_step_pct=pyramid_step,
+                                                                max_pyramids=max_pyr,
+                                                                verbose=False,
+                                                                pyramid_size_schedule=size_sched,
+                                                                min_pyramid_spacing_pct=min_space,
+                                                                pyramid_acceleration=accel,
+                                                                time_decay_exit_seconds=time_decay,
+                                                                volatility_filter_type=vol_type,
+                                                                volatility_min_pct=vol_min,
+                                                                volatility_window_size=vol_win
+                                                            )
 
-                                entry = {
-                                    'threshold': threshold,
-                                    'trailing': trailing,
-                                    'pyramid_step': pyramid_step,
-                                    'max_pyramids': max_pyr if max_pyr < 9999 else 'unlimited',
-                                    'poll_interval': poll_label,
-                                    'total_pnl': result['total_pnl'],
-                                    'rounds': result['total_rounds'],
-                                    'avg_pnl': result['avg_pnl'],
-                                    'win_rate': result['win_rate'],
-                                    'avg_pyramids': result['avg_pyramids']
-                                }
+                                                            time_decay_label = 'None' if time_decay is None else f'{time_decay}s'
+                                                            entry = {
+                                                                'threshold': threshold,
+                                                                'trailing': trailing,
+                                                                'pyramid_step': pyramid_step,
+                                                                'max_pyramids': max_pyr if max_pyr < 9999 else 'unlimited',
+                                                                'poll_interval': poll_label,
+                                                                'size_schedule': size_sched,
+                                                                'acceleration': accel,
+                                                                'min_spacing': min_space,
+                                                                'time_decay': time_decay_label,
+                                                                'vol_type': vol_type,
+                                                                'vol_min': vol_min,
+                                                                'vol_window': vol_win,
+                                                                'total_pnl': result['total_pnl'],
+                                                                'rounds': result['total_rounds'],
+                                                                'avg_pnl': result['avg_pnl'],
+                                                                'win_rate': result['win_rate'],
+                                                                'avg_pyramids': result['avg_pyramids']
+                                                            }
 
-                                # Write immediately to disk
-                                writer.writerow(entry)
-                                f.flush()
+                                                            # Write immediately to disk
+                                                            writer.writerow(entry)
+                                                            f.flush()
 
-                                # Maintain only top N in memory (sorted insert)
-                                if len(top_results) < TOP_N:
-                                    top_results.append(entry)
-                                    top_results.sort(key=lambda x: x['total_pnl'], reverse=True)
-                                elif entry['total_pnl'] > top_results[-1]['total_pnl']:
-                                    top_results[-1] = entry
-                                    top_results.sort(key=lambda x: x['total_pnl'], reverse=True)
+                                                            # Maintain only top N in memory
+                                                            if len(top_results) < TOP_N:
+                                                                top_results.append(entry)
+                                                                top_results.sort(key=lambda x: x['total_pnl'], reverse=True)
+                                                            elif entry['total_pnl'] > top_results[-1]['total_pnl']:
+                                                                top_results[-1] = entry
+                                                                top_results.sort(key=lambda x: x['total_pnl'], reverse=True)
 
-                            except Exception as e:
-                                print(f"\n  Error: {e}")
+                                                        except Exception as e:
+                                                            if completed % 1000 == 0:
+                                                                print(f"\n  Error: {e}")
 
     print()
     return log_file, top_results
@@ -209,10 +269,11 @@ def run_grid_search(
 def run_refined_search(
     coin: str,
     tick_streamer: Callable,
-    top_results: List[Dict]
+    top_results: List[Dict],
+    step_divisor: int = 2
 ) -> Tuple[str, Dict]:
     """
-    Refine search around top results including poll_interval.
+    Refine search around top results with all 12 parameters.
 
     Memory-efficient: streams prices from disk for each backtest,
     only keeps the single best result in memory.
@@ -221,28 +282,41 @@ def run_refined_search(
         coin: Trading pair symbol
         tick_streamer: Callable that returns a generator of (timestamp, price) tick data
         top_results: Top N results from grid search to refine around
+        step_divisor: How much finer to make the grid (2 = half steps, 4 = quarter steps)
 
     Returns:
         Tuple of (log_file_path, best_result)
     """
     best_result = None
 
-    log_file = os.path.join(LOG_DIR, f"{coin}_pyramid_v2_refined.csv")
+    log_file = os.path.join(LOG_DIR, f"{coin}_pyramid_v3_refined.csv")
+
+    fieldnames = [
+        'base_config',
+        'threshold', 'trailing', 'pyramid_step', 'max_pyramids', 'poll_interval',
+        'size_schedule', 'acceleration', 'min_spacing', 'time_decay',
+        'vol_type', 'vol_min', 'vol_window',
+        'total_pnl', 'rounds', 'avg_pnl', 'win_rate', 'avg_pyramids'
+    ]
 
     with open(log_file, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=[
-            'base_threshold', 'base_trailing', 'base_pyramid', 'base_max_pyr', 'base_poll',
-            'threshold', 'trailing', 'pyramid_step', 'max_pyramids', 'poll_interval',
-            'total_pnl', 'rounds', 'avg_pnl', 'win_rate', 'avg_pyramids'
-        ])
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
 
         for rank, top in enumerate(top_results, 1):
+            # Extract base values from top result
             base_t = top['threshold']
             base_tr = top['trailing']
             base_p = top['pyramid_step']
             base_mp = top['max_pyramids']
             base_poll = top.get('poll_interval', '1.0s')
+            base_size_sched = top.get('size_schedule', 'fixed')
+            base_accel = top.get('acceleration', 1.0)
+            base_min_space = top.get('min_spacing', 0.0)
+            base_time_decay = top.get('time_decay', 'None')
+            base_vol_type = top.get('vol_type', 'none')
+            base_vol_min = top.get('vol_min', 0.0)
+            base_vol_win = top.get('vol_window', 100)
 
             # Handle 'unlimited' string
             if base_mp == 'unlimited':
@@ -254,88 +328,136 @@ def run_refined_search(
             else:
                 base_poll_val = float(base_poll.replace('s', ''))
 
-            print(f"\n  Refining #{rank}: {base_t}% / {base_tr}% / {base_p}% / {base_mp} pyramids / {base_poll}")
+            # Parse time_decay
+            if base_time_decay == 'None' or base_time_decay is None:
+                base_time_decay_val = None
+            else:
+                base_time_decay_val = int(str(base_time_decay).replace('s', ''))
 
-            # Generate refined grid around this point
-            thresholds = [round(base_t + 0.1 * i, 1) for i in range(-5, 6) if base_t + 0.1 * i > 0]
-            trailings = [round(base_tr + 0.1 * i, 2) for i in range(-5, 6) if base_tr + 0.1 * i > 0]
-            pyramids = [round(base_p + 0.1 * i, 2) for i in range(-5, 6) if base_p + 0.1 * i > 0]
+            base_config = f"#{rank}: T={base_t}% Tr={base_tr}% P={base_p}%"
+            print(f"\n  Refining {base_config}")
 
-            # For max_pyramids, test ±50% around the value
+            # Generate refined values around each numeric parameter
+            step = 0.1 / step_divisor
+            thresholds = [round(base_t + step * i, 2) for i in range(-3, 4) if base_t + step * i > 0]
+            trailings = [round(base_tr + step * i, 2) for i in range(-3, 4) if base_tr + step * i > 0]
+            pyramids = [round(base_p + step * i, 2) for i in range(-3, 4) if base_p + step * i > 0]
+
+            # For max_pyramids, test nearby values
             if base_mp >= 9999:
                 max_pyr_variants = [640, 9999]
             else:
-                mp_low = max(5, int(base_mp * 0.5))
-                mp_high = min(9999, int(base_mp * 2))
+                mp_low = max(5, int(base_mp * 0.7))
+                mp_high = min(9999, int(base_mp * 1.5))
                 max_pyr_variants = sorted(set([mp_low, base_mp, mp_high]))
 
             # For poll_interval, test nearby values
             if base_poll_val == 0:
-                poll_variants = [0, 0.1, 0.2]  # tick and nearby
-            elif base_poll_val >= 3.2:
-                poll_variants = [base_poll_val / 2, base_poll_val, base_poll_val * 2]
+                poll_variants = [0, 0.1]
             else:
-                poll_variants = [max(0, base_poll_val / 2), base_poll_val, base_poll_val * 2]
+                poll_variants = [max(0.1, base_poll_val / 2), base_poll_val, base_poll_val * 2]
 
-            total = len(thresholds) * len(trailings) * len(pyramids) * len(max_pyr_variants) * len(poll_variants)
+            # Categorical params - keep the best one only
+            size_schedules = [base_size_sched]
+
+            # Refine acceleration around base
+            accel_step = 0.1 / step_divisor
+            accelerations = [round(base_accel + accel_step * i, 2) for i in range(-2, 3) if base_accel + accel_step * i >= 0.5]
+
+            # Refine min_spacing around base
+            space_step = 0.5 / step_divisor
+            min_spacings = [round(base_min_space + space_step * i, 2) for i in range(-2, 3) if base_min_space + space_step * i >= 0]
+
+            # Time decay - test nearby values
+            if base_time_decay_val is None:
+                time_decays = [None]
+            else:
+                time_decays = [int(base_time_decay_val * 0.5), base_time_decay_val, int(base_time_decay_val * 1.5)]
+                time_decays = [t for t in time_decays if t >= 60]
+
+            # Volatility - keep same type, refine threshold
+            vol_types = [base_vol_type]
+            vol_step = 0.25 / step_divisor
+            vol_mins = [round(base_vol_min + vol_step * i, 2) for i in range(-2, 3) if base_vol_min + vol_step * i >= 0]
+            vol_windows = [base_vol_win]  # Keep same window
+
+            total = (len(thresholds) * len(trailings) * len(pyramids) *
+                     len(max_pyr_variants) * len(poll_variants) * len(size_schedules) *
+                     len(accelerations) * len(min_spacings) * len(time_decays) *
+                     len(vol_types) * len(vol_mins) * len(vol_windows))
             completed = 0
 
             for poll_interval in poll_variants:
                 poll_label = "tick" if poll_interval == 0 else f"{poll_interval}s"
 
-                for threshold in thresholds:
-                    for trailing in trailings:
-                        for pyramid_step in pyramids:
-                            for max_pyr in max_pyr_variants:
-                                completed += 1
+                for size_sched in size_schedules:
+                    for accel in accelerations:
+                        for min_space in min_spacings:
+                            for time_decay in time_decays:
+                                for vol_type in vol_types:
+                                    for vol_min in vol_mins:
+                                        for vol_win in vol_windows:
+                                            for threshold in thresholds:
+                                                for trailing in trailings:
+                                                    for pyramid_step in pyramids:
+                                                        for max_pyr in max_pyr_variants:
+                                                            completed += 1
 
-                                if completed % 100 == 0:
-                                    print(f"\r    [{completed}/{total}]    ", end="", flush=True)
+                                                            if completed % 100 == 0:
+                                                                print(f"\r    [{completed}/{total}]    ", end="", flush=True)
 
-                                try:
-                                    # Aggregate tick data to the poll interval
-                                    price_stream = aggregate_ticks_to_interval(
-                                        tick_streamer,
-                                        poll_interval
-                                    )
+                                                            try:
+                                                                price_stream = aggregate_ticks_to_interval(
+                                                                    tick_streamer,
+                                                                    poll_interval
+                                                                )
 
-                                    result = run_pyramid_backtest(
-                                        price_stream,
-                                        threshold_pct=threshold,
-                                        trailing_pct=trailing,
-                                        pyramid_step_pct=pyramid_step,
-                                        max_pyramids=max_pyr,
-                                        verbose=False
-                                    )
+                                                                result = run_pyramid_backtest(
+                                                                    price_stream,
+                                                                    threshold_pct=threshold,
+                                                                    trailing_pct=trailing,
+                                                                    pyramid_step_pct=pyramid_step,
+                                                                    max_pyramids=max_pyr,
+                                                                    verbose=False,
+                                                                    pyramid_size_schedule=size_sched,
+                                                                    min_pyramid_spacing_pct=min_space,
+                                                                    pyramid_acceleration=accel,
+                                                                    time_decay_exit_seconds=time_decay,
+                                                                    volatility_filter_type=vol_type,
+                                                                    volatility_min_pct=vol_min,
+                                                                    volatility_window_size=vol_win
+                                                                )
 
-                                    entry = {
-                                        'base_threshold': base_t,
-                                        'base_trailing': base_tr,
-                                        'base_pyramid': base_p,
-                                        'base_max_pyr': base_mp if base_mp < 9999 else 'unlimited',
-                                        'base_poll': base_poll,
-                                        'threshold': threshold,
-                                        'trailing': trailing,
-                                        'pyramid_step': pyramid_step,
-                                        'max_pyramids': max_pyr if max_pyr < 9999 else 'unlimited',
-                                        'poll_interval': poll_label,
-                                        'total_pnl': result['total_pnl'],
-                                        'rounds': result['total_rounds'],
-                                        'avg_pnl': result['avg_pnl'],
-                                        'win_rate': result['win_rate'],
-                                        'avg_pyramids': result['avg_pyramids']
-                                    }
+                                                                time_decay_label = 'None' if time_decay is None else f'{time_decay}s'
+                                                                entry = {
+                                                                    'base_config': base_config,
+                                                                    'threshold': threshold,
+                                                                    'trailing': trailing,
+                                                                    'pyramid_step': pyramid_step,
+                                                                    'max_pyramids': max_pyr if max_pyr < 9999 else 'unlimited',
+                                                                    'poll_interval': poll_label,
+                                                                    'size_schedule': size_sched,
+                                                                    'acceleration': accel,
+                                                                    'min_spacing': min_space,
+                                                                    'time_decay': time_decay_label,
+                                                                    'vol_type': vol_type,
+                                                                    'vol_min': vol_min,
+                                                                    'vol_window': vol_win,
+                                                                    'total_pnl': result['total_pnl'],
+                                                                    'rounds': result['total_rounds'],
+                                                                    'avg_pnl': result['avg_pnl'],
+                                                                    'win_rate': result['win_rate'],
+                                                                    'avg_pyramids': result['avg_pyramids']
+                                                                }
 
-                                    # Write immediately to disk
-                                    writer.writerow(entry)
-                                    f.flush()
+                                                                writer.writerow(entry)
+                                                                f.flush()
 
-                                    # Track only the best result
-                                    if best_result is None or entry['total_pnl'] > best_result['total_pnl']:
-                                        best_result = entry
+                                                                if best_result is None or entry['total_pnl'] > best_result['total_pnl']:
+                                                                    best_result = entry
 
-                                except:
-                                    pass
+                                                            except:
+                                                                pass
 
             print()
 
@@ -346,10 +468,11 @@ def process_coin(
     coin: str,
     tick_streamer: Callable,
     num_ticks: int,
-    quick_test: bool = False
+    quick_test: bool = False,
+    param_overrides: Dict[str, List] = None
 ) -> CoinResult:
     """
-    Process a single coin through grid search and refinement.
+    Process a single coin through grid search and refinement with all 12 parameters.
 
     Memory-efficient: uses tick_streamer to stream data from disk
     for each backtest, avoiding loading all ticks into memory.
@@ -359,6 +482,7 @@ def process_coin(
         tick_streamer: Callable that returns a generator of (timestamp, price) tick data
         num_ticks: Number of ticks in the dataset (for display)
         quick_test: Use reduced grid for quick testing
+        param_overrides: Optional dict to override default parameter grids
 
     Returns:
         CoinResult with best parameters and analytics
@@ -366,36 +490,62 @@ def process_coin(
     print(f"\n{'#' * 70}")
     print(f"# PROCESSING: {coin}")
     print(f"{'#' * 70}")
-    print(f"Data: {num_ticks:,} filtered ticks (streaming from disk)")
+    print(f"Data: {num_ticks:,} filtered ticks (streaming from memory)")
 
-    # Select grid parameters
+    # Build parameter grid
     if quick_test:
-        thresholds = THRESHOLDS_QUICK
-        trailings = TRAILINGS_QUICK
-        pyramid_steps = PYRAMID_STEPS_QUICK
-        max_pyramids = MAX_PYRAMIDS_QUICK
-        poll_intervals = POLL_INTERVALS_QUICK
+        param_grid = {
+            'threshold': THRESHOLDS_QUICK,
+            'trailing': TRAILINGS_QUICK,
+            'pyramid_step': PYRAMID_STEPS_QUICK,
+            'max_pyramids': MAX_PYRAMIDS_QUICK,
+            'poll_interval': POLL_INTERVALS_QUICK,
+            'size_schedule': SIZE_SCHEDULES_QUICK,
+            'acceleration': ACCELERATIONS_QUICK,
+            'min_spacing': MIN_SPACINGS_QUICK,
+            'time_decay': TIME_DECAYS_QUICK,
+            'vol_type': VOL_TYPES_QUICK,
+            'vol_min': VOL_MINS_QUICK,
+            'vol_window': VOL_WINDOWS_QUICK,
+        }
     else:
-        thresholds = THRESHOLDS
-        trailings = TRAILINGS
-        pyramid_steps = PYRAMID_STEPS
-        max_pyramids = MAX_PYRAMIDS
-        poll_intervals = POLL_INTERVALS
+        param_grid = {
+            'threshold': THRESHOLDS,
+            'trailing': TRAILINGS,
+            'pyramid_step': PYRAMID_STEPS,
+            'max_pyramids': MAX_PYRAMIDS,
+            'poll_interval': POLL_INTERVALS,
+            'size_schedule': SIZE_SCHEDULES,
+            'acceleration': ACCELERATIONS,
+            'min_spacing': MIN_SPACINGS,
+            'time_decay': TIME_DECAYS,
+            'vol_type': VOL_TYPES,
+            'vol_min': VOL_MINS,
+            'vol_window': VOL_WINDOWS,
+        }
 
-    total_combos = len(thresholds) * len(trailings) * len(pyramid_steps) * len(max_pyramids) * len(poll_intervals)
+    # Apply any overrides
+    if param_overrides:
+        param_grid.update(param_overrides)
+
+    # Calculate total combinations
+    total_combos = 1
+    for values in param_grid.values():
+        total_combos *= len(values)
 
     # Grid search
     print(f"\n--- Grid Search ({total_combos:,} combinations) ---")
-    print(f"  Poll intervals: {['tick' if p==0 else f'{p}s' for p in poll_intervals]}")
+    poll_labels = ['tick' if p == 0 else f'{p}s' for p in param_grid['poll_interval']]
+    print(f"  Poll intervals: {poll_labels}")
+    print(f"  Size schedules: {param_grid['size_schedule']}")
+    print(f"  Accelerations: {param_grid['acceleration']}")
     start = time.time()
-    grid_log_file, top_10 = run_grid_search(
-        coin, tick_streamer, thresholds, trailings, pyramid_steps, max_pyramids, poll_intervals
-    )
+    grid_log_file, top_10 = run_grid_search(coin, tick_streamer, param_grid)
     print(f"  ✓ Completed in {(time.time()-start)/60:.1f} minutes")
 
     # Save top 10
     if top_10:
-        with open(os.path.join(LOG_DIR, f"{coin}_pyramid_v2_top10.csv"), 'w', newline='') as f:
+        with open(os.path.join(LOG_DIR, f"{coin}_pyramid_v3_top10.csv"), 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=top_10[0].keys())
             writer.writeheader()
             writer.writerows(top_10)
@@ -404,7 +554,10 @@ def process_coin(
     for i, r in enumerate(top_10, 1):
         mp = r['max_pyramids']
         poll = r.get('poll_interval', '1s')
-        print(f"  #{i}: T={r['threshold']}% Tr={r['trailing']}% P={r['pyramid_step']}% MP={mp} Poll={poll} → {r['total_pnl']:+.2f}%")
+        size_s = r.get('size_schedule', 'fixed')
+        accel = r.get('acceleration', 1.0)
+        print(f"  #{i}: T={r['threshold']}% Tr={r['trailing']}% P={r['pyramid_step']}% "
+              f"MP={mp} Poll={poll} Sz={size_s} Acc={accel} → {r['total_pnl']:+.2f}%")
 
     # Refined search
     print(f"\n--- Refined Search ---")
@@ -417,6 +570,9 @@ def process_coin(
         best = top_10[0] if top_10 else {
             'threshold': 5, 'trailing': 2, 'pyramid_step': 2,
             'max_pyramids': 20, 'poll_interval': '1.0s',
+            'size_schedule': 'fixed', 'acceleration': 1.0,
+            'min_spacing': 0.0, 'time_decay': 'None',
+            'vol_type': 'none', 'vol_min': 0.0, 'vol_window': 100,
             'total_pnl': 0, 'win_rate': 0
         }
 
@@ -430,6 +586,13 @@ def process_coin(
     else:
         best_poll_val = float(best_poll.replace('s', ''))
 
+    # Parse time_decay
+    best_time_decay = best.get('time_decay', 'None')
+    if best_time_decay == 'None' or best_time_decay is None:
+        best_time_decay_val = None
+    else:
+        best_time_decay_val = int(str(best_time_decay).replace('s', ''))
+
     # Aggregate ticks to best poll interval and run
     price_stream = aggregate_ticks_to_interval(tick_streamer, best_poll_val)
     best_result = run_pyramid_backtest(
@@ -438,7 +601,14 @@ def process_coin(
         trailing_pct=best['trailing'],
         pyramid_step_pct=best['pyramid_step'],
         max_pyramids=best_max_pyr,
-        verbose=False
+        verbose=False,
+        pyramid_size_schedule=best.get('size_schedule', 'fixed'),
+        min_pyramid_spacing_pct=best.get('min_spacing', 0.0),
+        pyramid_acceleration=best.get('acceleration', 1.0),
+        time_decay_exit_seconds=best_time_decay_val,
+        volatility_filter_type=best.get('vol_type', 'none'),
+        volatility_min_pct=best.get('vol_min', 0.0),
+        volatility_window_size=best.get('vol_window', 100)
     )
 
     # Generate analytics - pop rounds to avoid keeping them in memory
@@ -451,13 +621,19 @@ def process_coin(
     del summaries
 
     print(f"\n🏆 BEST FOR {coin}:")
-    print(f"   Threshold:    {best['threshold']}%")
-    print(f"   Trailing:     {best['trailing']}%")
-    print(f"   Pyramid Step: {best['pyramid_step']}%")
-    print(f"   Max Pyramids: {best['max_pyramids']}")
-    print(f"   Poll Interval:{best.get('poll_interval', '1.0s')}")
-    print(f"   Total P&L:    {best['total_pnl']:+.2f}%")
-    print(f"   Win Rate:     {best['win_rate']:.1f}%")
+    print(f"   Threshold:     {best['threshold']}%")
+    print(f"   Trailing:      {best['trailing']}%")
+    print(f"   Pyramid Step:  {best['pyramid_step']}%")
+    print(f"   Max Pyramids:  {best['max_pyramids']}")
+    print(f"   Poll Interval: {best.get('poll_interval', '1.0s')}")
+    print(f"   Size Schedule: {best.get('size_schedule', 'fixed')}")
+    print(f"   Acceleration:  {best.get('acceleration', 1.0)}")
+    print(f"   Min Spacing:   {best.get('min_spacing', 0.0)}%")
+    print(f"   Time Decay:    {best.get('time_decay', 'None')}")
+    print(f"   Vol Type:      {best.get('vol_type', 'none')}")
+    print(f"   Vol Min:       {best.get('vol_min', 0.0)}%")
+    print(f"   Total P&L:     {best['total_pnl']:+.2f}%")
+    print(f"   Win Rate:      {best['win_rate']:.1f}%")
 
     # Print analytics summary
     print_analytics_summary(analytics, coin)
@@ -466,30 +642,32 @@ def process_coin(
 
 
 def print_final_report(results: Dict[str, CoinResult], years: int):
-    """Print and save comprehensive final report."""
-    print("\n" + "=" * 115)
-    print("ENHANCED PYRAMID STRATEGY - FINAL RECOMMENDATIONS")
-    print("=" * 115)
+    """Print and save comprehensive final report with all 12 parameters."""
+    print("\n" + "=" * 140)
+    print("ENHANCED PYRAMID STRATEGY v3 - FINAL RECOMMENDATIONS")
+    print("=" * 140)
     print(f"Data period: {years} year(s) of tick data")
     print()
 
-    # Header
-    print(f"{'Coin':<10} {'Threshold':<10} {'Trailing':<10} {'PyrStep':<10} {'MaxPyr':<10} {'Poll':<10} "
-          f"{'P&L':<10} {'WinRate':<10} {'MaxDD':<10} {'MinAcct':<12}")
-    print("-" * 115)
-    
+    # Compact header for terminal (key params only)
+    print(f"{'Coin':<10} {'Thresh':<8} {'Trail':<8} {'PyrStp':<8} {'MaxPyr':<8} {'Poll':<8} "
+          f"{'SzSched':<12} {'Accel':<6} {'P&L':<10} {'WinRate':<8}")
+    print("-" * 140)
+
     final_data = []
-    
+
     for coin in results:
         r = results[coin].best_result
         a = results[coin].analytics
 
         mp = r['max_pyramids'] if r['max_pyramids'] != 'unlimited' else '∞'
         poll = r.get('poll_interval', '1.0s')
+        size_sched = r.get('size_schedule', 'fixed')
+        accel = r.get('acceleration', 1.0)
         min_acct = a['account_sizing']['recommended_account']
 
-        print(f"{coin:<10} {r['threshold']:<10.1f}% {r['trailing']:<10.1f}% {r['pyramid_step']:<10.1f}% "
-              f"{mp:<10} {poll:<10} {r['total_pnl']:+8.1f}%  {r['win_rate']:<10.1f}% {a['max_drawdown']:<10.1f}% ${min_acct:<10.0f}")
+        print(f"{coin:<10} {r['threshold']:<8.1f}% {r['trailing']:<8.1f}% {r['pyramid_step']:<8.1f}% "
+              f"{mp:<8} {poll:<8} {size_sched:<12} {accel:<6.1f} {r['total_pnl']:+8.1f}%  {r['win_rate']:<8.1f}%")
 
         final_data.append({
             'coin': coin,
@@ -498,6 +676,13 @@ def print_final_report(results: Dict[str, CoinResult], years: int):
             'pyramid_step': r['pyramid_step'],
             'max_pyramids': r['max_pyramids'],
             'poll_interval': poll,
+            'size_schedule': r.get('size_schedule', 'fixed'),
+            'acceleration': r.get('acceleration', 1.0),
+            'min_spacing': r.get('min_spacing', 0.0),
+            'time_decay': r.get('time_decay', 'None'),
+            'vol_type': r.get('vol_type', 'none'),
+            'vol_min': r.get('vol_min', 0.0),
+            'vol_window': r.get('vol_window', 100),
             'total_pnl': r['total_pnl'],
             'avg_pnl': r['avg_pnl'],
             'win_rate': r['win_rate'],
@@ -510,14 +695,14 @@ def print_final_report(results: Dict[str, CoinResult], years: int):
             'total_months': a['total_months']
         })
 
-    print("-" * 115)
-    
+    print("-" * 140)
+
     # Save final recommendations
-    with open(os.path.join(LOG_DIR, "pyramid_v2_recommendations.csv"), 'w', newline='') as f:
+    with open(os.path.join(LOG_DIR, "pyramid_v3_recommendations.csv"), 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=final_data[0].keys())
         writer.writeheader()
         writer.writerows(final_data)
-    
+
     # Save monthly breakdown for each coin
     for coin, cr in results.items():
         monthly = cr.analytics.get('monthly_breakdown', {})
@@ -534,30 +719,43 @@ def print_final_report(results: Dict[str, CoinResult], years: int):
                         'wins': data['wins'],
                         'win_rate': round(wr, 1)
                     })
-    
+
     # Summary text file
-    with open(os.path.join(LOG_DIR, "pyramid_v2_summary.txt"), 'w') as f:
-        f.write("ENHANCED PYRAMID STRATEGY OPTIMIZER v2\n")
-        f.write("=" * 50 + "\n\n")
+    with open(os.path.join(LOG_DIR, "pyramid_v3_summary.txt"), 'w') as f:
+        f.write("ENHANCED PYRAMID STRATEGY OPTIMIZER v3\n")
+        f.write("=" * 60 + "\n\n")
         f.write(f"Completed: {datetime.now()}\n")
-        f.write(f"Data: {years} year(s) of tick data\n\n")
-        
+        f.write(f"Data: {years} year(s) of tick data\n")
+        f.write(f"Parameters: 12 (threshold, trailing, pyramid_step, max_pyramids,\n")
+        f.write(f"            poll_interval, size_schedule, acceleration, min_spacing,\n")
+        f.write(f"            time_decay, vol_type, vol_min, vol_window)\n\n")
+
         for item in final_data:
             f.write(f"{item['coin']}:\n")
+            f.write(f"  --- Core Parameters ---\n")
             f.write(f"  Threshold:     {item['threshold']:.1f}%\n")
             f.write(f"  Trailing:      {item['trailing']:.1f}%\n")
             f.write(f"  Pyramid Step:  {item['pyramid_step']:.1f}%\n")
             f.write(f"  Max Pyramids:  {item['max_pyramids']}\n")
             f.write(f"  Poll Interval: {item['poll_interval']}\n")
+            f.write(f"  --- New Parameters ---\n")
+            f.write(f"  Size Schedule: {item['size_schedule']}\n")
+            f.write(f"  Acceleration:  {item['acceleration']}\n")
+            f.write(f"  Min Spacing:   {item['min_spacing']}%\n")
+            f.write(f"  Time Decay:    {item['time_decay']}\n")
+            f.write(f"  Vol Type:      {item['vol_type']}\n")
+            f.write(f"  Vol Min:       {item['vol_min']}%\n")
+            f.write(f"  Vol Window:    {item['vol_window']}\n")
+            f.write(f"  --- Results ---\n")
             f.write(f"  Total P&L:     {item['total_pnl']:+.2f}%\n")
             f.write(f"  Win Rate:      {item['win_rate']:.1f}%\n")
             f.write(f"  Sharpe Ratio:  {item['sharpe_ratio']:.2f}\n")
             f.write(f"  Max Drawdown:  {item['max_drawdown']:.2f}%\n")
             f.write(f"  Min Account:   ${item['recommended_account']:.0f} (recommended)\n\n")
-    
+
     print(f"\n✓ Results saved to {LOG_DIR}/")
-    print(f"  - pyramid_v2_recommendations.csv")
-    print(f"  - pyramid_v2_summary.txt")
+    print(f"  - pyramid_v3_recommendations.csv")
+    print(f"  - pyramid_v3_summary.txt")
     print(f"  - [COIN]_monthly_breakdown.csv")
 
 
@@ -696,7 +894,21 @@ def print_verification_comparison(
 def main():
     import argparse
 
-    parser = argparse.ArgumentParser(description="Enhanced Pyramid Strategy Optimizer v2 (Memory-Optimized)")
+    parser = argparse.ArgumentParser(
+        description="Enhanced Pyramid Strategy Optimizer v3 (12 Parameters, Memory-Optimized)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Quick test with defaults
+  python optimize_pyramid_v2.py --quick-test --coins BTCUSDT
+
+  # Custom parameter ranges
+  python optimize_pyramid_v2.py --acceleration=1.0,1.1,1.2,1.3 --time-decay=None,300,600
+
+  # Single coin, full grid
+  python optimize_pyramid_v2.py --coins BTCUSDT
+        """
+    )
     parser.add_argument("--coins", type=str, default=None, help="Comma-separated coins to test")
     parser.add_argument("--quick-test", action="store_true", help="Use reduced grid for quick testing")
     parser.add_argument("--verify-ticks", action="store_true",
@@ -705,11 +917,55 @@ def main():
                         help="Skip grid search, run ONLY with filtered tick data")
     parser.add_argument("--tick-filter", type=float, default=0.01,
                         help="Minimum price move %% to include in tick data (default: 0.01%% = 1 basis point)")
+
+    # New parameter CLI args (allow overriding default grids)
+    parser.add_argument("--size-schedule", type=str, default=None,
+                        help="Pyramid size schedules (comma-separated). Default: fixed,linear_decay,exp_decay")
+    parser.add_argument("--acceleration", type=str, default=None,
+                        help="Pyramid acceleration values (comma-separated). Default: 1.0,1.2,1.5")
+    parser.add_argument("--min-spacing", type=str, default=None,
+                        help="Minimum pyramid spacing %% (comma-separated). Default: 0.0,1.0,2.0")
+    parser.add_argument("--time-decay", type=str, default=None,
+                        help="Time decay exit seconds (comma-separated, use 'None' for disabled). Default: None,300,900")
+    parser.add_argument("--vol-type", type=str, default=None,
+                        help="Volatility filter types (comma-separated). Default: none,stddev,range")
+    parser.add_argument("--vol-min", type=str, default=None,
+                        help="Volatility minimum %% thresholds (comma-separated). Default: 0.0,0.5,1.0")
+    parser.add_argument("--vol-window", type=str, default=None,
+                        help="Volatility window sizes (comma-separated). Default: 50,100,200")
+
     args = parser.parse_args()
 
+    # Build parameter overrides from CLI args
+    param_overrides = {}
+
+    if args.size_schedule:
+        param_overrides['size_schedule'] = args.size_schedule.split(',')
+
+    if args.acceleration:
+        param_overrides['acceleration'] = [float(x) for x in args.acceleration.split(',')]
+
+    if args.min_spacing:
+        param_overrides['min_spacing'] = [float(x) for x in args.min_spacing.split(',')]
+
+    if args.time_decay:
+        param_overrides['time_decay'] = [
+            None if x.lower() == 'none' else int(x)
+            for x in args.time_decay.split(',')
+        ]
+
+    if args.vol_type:
+        param_overrides['vol_type'] = args.vol_type.split(',')
+
+    if args.vol_min:
+        param_overrides['vol_min'] = [float(x) for x in args.vol_min.split(',')]
+
+    if args.vol_window:
+        param_overrides['vol_window'] = [int(x) for x in args.vol_window.split(',')]
+
     print("=" * 70)
-    print("ENHANCED PYRAMID STRATEGY OPTIMIZER v2")
-    print("(Memory-Optimized: Streaming from Disk)")
+    print("ENHANCED PYRAMID STRATEGY OPTIMIZER v3")
+    print("(12 Parameters, Memory-Optimized)")
     print("=" * 70)
     print(f"Started: {datetime.now()}")
     print()
@@ -720,23 +976,33 @@ def main():
     # Parse coins
     coins = args.coins.split(",") if args.coins else DEFAULT_COINS
 
-    # Grid info
+    # Calculate grid size
     if args.quick_test:
-        combos = len(THRESHOLDS_QUICK) * len(TRAILINGS_QUICK) * len(PYRAMID_STEPS_QUICK) * len(MAX_PYRAMIDS_QUICK) * len(POLL_INTERVALS_QUICK)
+        base_combos = (len(THRESHOLDS_QUICK) * len(TRAILINGS_QUICK) * len(PYRAMID_STEPS_QUICK) *
+                       len(MAX_PYRAMIDS_QUICK) * len(POLL_INTERVALS_QUICK))
+        new_combos = (len(SIZE_SCHEDULES_QUICK) * len(ACCELERATIONS_QUICK) * len(MIN_SPACINGS_QUICK) *
+                      len(TIME_DECAYS_QUICK) * len(VOL_TYPES_QUICK) * len(VOL_MINS_QUICK) * len(VOL_WINDOWS_QUICK))
         poll_intervals = POLL_INTERVALS_QUICK
         print("\n[QUICK TEST MODE]")
     else:
-        combos = len(THRESHOLDS) * len(TRAILINGS) * len(PYRAMID_STEPS) * len(MAX_PYRAMIDS) * len(POLL_INTERVALS)
+        base_combos = (len(THRESHOLDS) * len(TRAILINGS) * len(PYRAMID_STEPS) *
+                       len(MAX_PYRAMIDS) * len(POLL_INTERVALS))
+        new_combos = (len(SIZE_SCHEDULES) * len(ACCELERATIONS) * len(MIN_SPACINGS) *
+                      len(TIME_DECAYS) * len(VOL_TYPES) * len(VOL_MINS) * len(VOL_WINDOWS))
         poll_intervals = POLL_INTERVALS
+
+    total_combos = base_combos * new_combos
 
     poll_labels = ['tick' if p == 0 else f'{p}s' for p in poll_intervals]
     print(f"\nConfiguration:")
     print(f"  Coins:          {', '.join(coins)}")
     print(f"  Data:           {years} year(s) of tick data")
-    print(f"  Grid:           {combos:,} combinations per coin")
-    print(f"  Max Pyramids:   {MAX_PYRAMIDS if not args.quick_test else MAX_PYRAMIDS_QUICK}")
+    print(f"  Grid:           {total_combos:,} combinations per coin")
+    print(f"  Parameters:     12 (5 original + 7 new)")
     print(f"  Poll Intervals: {poll_labels}")
-    print(f"  Memory Mode:    Streaming (low RAM usage)")
+    print(f"  Memory Mode:    Streaming from memory cache")
+    if param_overrides:
+        print(f"  Overrides:      {list(param_overrides.keys())}")
     print("=" * 70)
 
     ensure_dirs()
@@ -783,8 +1049,12 @@ def main():
     for i, (coin, tick_streamer, num_ticks) in enumerate(valid_coins, 1):
         print(f"\n[{i}/{len(valid_coins)}] Processing {coin}...")
 
-        # Process this coin (streams from disk, minimal RAM)
-        result = process_coin(coin, tick_streamer, num_ticks, quick_test=args.quick_test)
+        # Process this coin (streams from memory, minimal RAM)
+        result = process_coin(
+            coin, tick_streamer, num_ticks,
+            quick_test=args.quick_test,
+            param_overrides=param_overrides if param_overrides else None
+        )
         all_results[coin] = result
 
         # Explicit garbage collection between coins to release any lingering memory

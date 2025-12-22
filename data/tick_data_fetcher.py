@@ -627,7 +627,8 @@ def create_filtered_tick_streamer(
     symbol: str,
     years: int = 3,
     min_move_pct: float = 0.01,
-    verbose: bool = True
+    verbose: bool = True,
+    preload_to_memory: bool = True
 ) -> callable:
     """
     Create a function that streams FILTERED ticks from cache.
@@ -636,11 +637,16 @@ def create_filtered_tick_streamer(
     yielded price. This dramatically reduces data points while preserving
     all meaningful price movements for strategy simulation.
 
+    MEMORY OPTIMIZATION: When preload_to_memory=True (default), loads all
+    filtered ticks into memory ONCE. This avoids re-reading the file for
+    each backtest iteration (332K+ file reads → 1 read).
+
     Args:
         symbol: Trading pair
         years: Number of years
         min_move_pct: Minimum price move % to include (default 0.01% = 1 basis point)
         verbose: Print progress during cache creation
+        preload_to_memory: Load all ticks into memory for faster iteration (default True)
 
     Returns:
         Callable that returns a generator of (datetime, price) tuples.
@@ -651,11 +657,14 @@ def create_filtered_tick_streamer(
     """
     cache_path = ensure_cached_tick_data_raw(symbol, years, verbose)
 
-    def stream_filtered_ticks() -> Generator[Tuple[datetime, float], None, None]:
-        """Generator that streams filtered ticks from cache."""
+    if preload_to_memory:
+        # MEMORY-OPTIMIZED: Load all filtered ticks into memory ONCE
+        if verbose:
+            print(f"  Loading filtered ticks into memory...")
+
+        filtered_ticks = []
         last_price = None
         total_ticks = 0
-        kept_ticks = 0
 
         with open(cache_path, 'r') as f:
             for line in f:
@@ -670,21 +679,64 @@ def create_filtered_tick_streamer(
                 if last_price is None:
                     # Always keep first price
                     last_price = price
-                    kept_ticks += 1
-                    yield (datetime.fromtimestamp(int(ts_ms_str) / 1000), price)
+                    filtered_ticks.append((datetime.fromtimestamp(int(ts_ms_str) / 1000), price))
                 else:
                     # Check if price moved enough
                     move_pct = abs((price - last_price) / last_price) * 100
                     if move_pct >= min_move_pct:
                         last_price = price
-                        kept_ticks += 1
-                        yield (datetime.fromtimestamp(int(ts_ms_str) / 1000), price)
+                        filtered_ticks.append((datetime.fromtimestamp(int(ts_ms_str) / 1000), price))
 
         if verbose and total_ticks > 0:
+            kept_ticks = len(filtered_ticks)
             reduction = (1 - kept_ticks / total_ticks) * 100
-            print(f"    Tick filter: {total_ticks:,} → {kept_ticks:,} ({reduction:.1f}% reduction)")
+            mem_mb = (kept_ticks * 48) / (1024 * 1024)  # Rough estimate: 48 bytes per tuple
+            print(f"  ✓ Loaded {kept_ticks:,} ticks into memory (~{mem_mb:.1f} MB)")
+            print(f"    Filter: {total_ticks:,} raw → {kept_ticks:,} filtered ({reduction:.1f}% reduction)")
 
-    return stream_filtered_ticks
+        def stream_from_memory() -> Generator[Tuple[datetime, float], None, None]:
+            """Generator that yields from pre-loaded memory list."""
+            for tick in filtered_ticks:
+                yield tick
+
+        return stream_from_memory
+
+    else:
+        # DISK STREAMING: Read from file each time (original behavior)
+        def stream_filtered_ticks() -> Generator[Tuple[datetime, float], None, None]:
+            """Generator that streams filtered ticks from cache."""
+            last_price = None
+            total_ticks = 0
+            kept_ticks = 0
+
+            with open(cache_path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+
+                    total_ticks += 1
+                    ts_ms_str, price_str = line.split(',')
+                    price = float(price_str)
+
+                    if last_price is None:
+                        # Always keep first price
+                        last_price = price
+                        kept_ticks += 1
+                        yield (datetime.fromtimestamp(int(ts_ms_str) / 1000), price)
+                    else:
+                        # Check if price moved enough
+                        move_pct = abs((price - last_price) / last_price) * 100
+                        if move_pct >= min_move_pct:
+                            last_price = price
+                            kept_ticks += 1
+                            yield (datetime.fromtimestamp(int(ts_ms_str) / 1000), price)
+
+            if verbose and total_ticks > 0:
+                reduction = (1 - kept_ticks / total_ticks) * 100
+                print(f"    Tick filter: {total_ticks:,} → {kept_ticks:,} ({reduction:.1f}% reduction)")
+
+        return stream_filtered_ticks
 
 
 def count_filtered_ticks(symbol: str, years: int, min_move_pct: float = 0.01) -> Tuple[int, int]:
