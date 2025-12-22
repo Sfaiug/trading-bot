@@ -200,24 +200,40 @@ def fetch_tick_data(
         print(f"Period: {years} year(s)")
     
     months = get_months_in_range(years)
+    expected_months = len(months)
     all_prices = []
     
     # Check for pre-aggregated cache first
     agg_cache_path = os.path.join(CACHE_DIR, f"{symbol}_{years}yr_agg{int(aggregate_seconds)}s.json")
     if os.path.exists(agg_cache_path):
         if verbose:
-            print(f"  Loading from aggregated cache...")
+            print(f"  Checking cache...")
         try:
             with open(agg_cache_path, 'r') as f:
-                data = json.load(f)
-            all_prices = [(datetime.fromisoformat(ts), p) for ts, p in data]
+                cache = json.load(f)
+            
+            # Validate cache has metadata and is complete
+            if isinstance(cache, dict) and cache.get('complete') == True:
+                months_in_cache = cache.get('months_completed', 0)
+                if months_in_cache >= expected_months - 2:  # Allow 2 months tolerance (data availability)
+                    data = cache.get('prices', [])
+                    all_prices = [(datetime.fromisoformat(ts), p) for ts, p in data]
+                    if verbose:
+                        print(f"  ✓ Loaded {len(all_prices):,} prices from cache ({months_in_cache}/{expected_months} months)")
+                        print(f"{'='*60}")
+                    return all_prices
+                else:
+                    if verbose:
+                        print(f"  ⚠ Cache incomplete ({months_in_cache}/{expected_months} months), re-downloading...")
+            else:
+                # Old format or incomplete cache
+                if verbose:
+                    print(f"  ⚠ Cache invalid or incomplete, re-downloading...")
+        except Exception as e:
             if verbose:
-                print(f"  ✓ Loaded {len(all_prices):,} prices from cache")
-                print(f"{'='*60}")
-            return all_prices
-        except Exception:
-            pass
+                print(f"  ⚠ Cache error: {e}, re-downloading...")
     
+    months_completed = 0
     for i, (year, month) in enumerate(months, 1):
         if verbose:
             print(f"  [{i}/{len(months)}] {year}-{month:02d}...", end=" ", flush=True)
@@ -231,6 +247,7 @@ def fetch_tick_data(
             continue
         
         aggregated, trade_count = result
+        months_completed += 1
         
         # Extend our results
         all_prices.extend(aggregated)
@@ -241,15 +258,23 @@ def fetch_tick_data(
     # Sort by timestamp
     all_prices.sort(key=lambda x: x[0])
     
-    # Cache the aggregated result for future runs
+    # Cache the aggregated result with metadata
     if all_prices:
         try:
             ensure_cache_dir()
-            cache_data = [(ts.isoformat(), p) for ts, p in all_prices]
+            cache_data = {
+                'complete': True,
+                'months_expected': expected_months,
+                'months_completed': months_completed,
+                'years': years,
+                'aggregate_seconds': aggregate_seconds,
+                'total_prices': len(all_prices),
+                'prices': [(ts.isoformat(), p) for ts, p in all_prices]
+            }
             with open(agg_cache_path, 'w') as f:
                 json.dump(cache_data, f)
             if verbose:
-                print(f"  ✓ Saved aggregated cache for future runs")
+                print(f"  ✓ Saved cache ({months_completed}/{expected_months} months, {len(all_prices):,} prices)")
         except Exception as e:
             if verbose:
                 print(f"  (Could not save cache: {e})")
@@ -596,6 +621,107 @@ def create_tick_streamer_raw(
                     yield (ts, float(price_str))
 
     return stream_ticks
+
+
+def create_filtered_tick_streamer(
+    symbol: str,
+    years: int = 3,
+    min_move_pct: float = 0.01,
+    verbose: bool = True
+) -> callable:
+    """
+    Create a function that streams FILTERED ticks from cache.
+
+    Only yields prices that moved at least min_move_pct from the previous
+    yielded price. This dramatically reduces data points while preserving
+    all meaningful price movements for strategy simulation.
+
+    Args:
+        symbol: Trading pair
+        years: Number of years
+        min_move_pct: Minimum price move % to include (default 0.01% = 1 basis point)
+        verbose: Print progress during cache creation
+
+    Returns:
+        Callable that returns a generator of (datetime, price) tuples.
+
+    Example:
+        With min_move_pct=0.01, only keeps prices that moved 0.01% or more:
+        $50,000 → $50,005 (kept, +0.01%) → $50,006 (skipped, +0.002%) → $50,010 (kept, +0.01%)
+    """
+    cache_path = ensure_cached_tick_data_raw(symbol, years, verbose)
+
+    def stream_filtered_ticks() -> Generator[Tuple[datetime, float], None, None]:
+        """Generator that streams filtered ticks from cache."""
+        last_price = None
+        total_ticks = 0
+        kept_ticks = 0
+
+        with open(cache_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+
+                total_ticks += 1
+                ts_ms_str, price_str = line.split(',')
+                price = float(price_str)
+
+                if last_price is None:
+                    # Always keep first price
+                    last_price = price
+                    kept_ticks += 1
+                    yield (datetime.fromtimestamp(int(ts_ms_str) / 1000), price)
+                else:
+                    # Check if price moved enough
+                    move_pct = abs((price - last_price) / last_price) * 100
+                    if move_pct >= min_move_pct:
+                        last_price = price
+                        kept_ticks += 1
+                        yield (datetime.fromtimestamp(int(ts_ms_str) / 1000), price)
+
+        if verbose and total_ticks > 0:
+            reduction = (1 - kept_ticks / total_ticks) * 100
+            print(f"    Tick filter: {total_ticks:,} → {kept_ticks:,} ({reduction:.1f}% reduction)")
+
+    return stream_filtered_ticks
+
+
+def count_filtered_ticks(symbol: str, years: int, min_move_pct: float = 0.01) -> Tuple[int, int]:
+    """
+    Count filtered ticks without running full simulation.
+
+    Returns:
+        Tuple of (total_raw_ticks, filtered_ticks)
+    """
+    cache_path = get_tick_cache_path(symbol, years)
+    if not os.path.exists(cache_path):
+        return 0, 0
+
+    last_price = None
+    total_ticks = 0
+    kept_ticks = 0
+
+    with open(cache_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+
+            total_ticks += 1
+            _, price_str = line.split(',')
+            price = float(price_str)
+
+            if last_price is None:
+                last_price = price
+                kept_ticks += 1
+            else:
+                move_pct = abs((price - last_price) / last_price) * 100
+                if move_pct >= min_move_pct:
+                    last_price = price
+                    kept_ticks += 1
+
+    return total_ticks, kept_ticks
 
 
 def count_cached_ticks_raw(symbol: str, years: int) -> int:

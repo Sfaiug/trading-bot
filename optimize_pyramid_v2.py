@@ -32,7 +32,9 @@ from data.tick_data_fetcher import (
     create_price_streamer,
     count_cached_prices,
     create_tick_streamer_raw,
-    count_cached_ticks_raw
+    count_cached_ticks_raw,
+    create_filtered_tick_streamer,
+    count_filtered_ticks
 )
 from backtest_pyramid import run_pyramid_backtest, PyramidRound
 from analytics import (
@@ -498,18 +500,20 @@ def verify_with_raw_ticks(
     coin: str,
     best_params: Dict,
     years: int,
+    min_move_pct: float = 0.01,
     verbose: bool = True
 ) -> Dict:
     """
-    Verify best parameters using raw tick-by-tick data.
+    Verify best parameters using filtered tick-by-tick data.
 
-    This provides maximum accuracy by using every single trade,
-    rather than 1-second aggregated data.
+    Uses filtered tick streaming that keeps only price moves >= min_move_pct.
+    This provides maximum accuracy while being much faster than raw ticks.
 
     Args:
         coin: Trading pair symbol
         best_params: Best parameters from grid search
         years: Number of years of data
+        min_move_pct: Minimum price move % to include (default 0.01% = 1 basis point)
         verbose: Print progress
 
     Returns:
@@ -521,14 +525,19 @@ def verify_with_raw_ticks(
         print(f"{'='*60}")
         print(f"Parameters: T={best_params['threshold']}% Tr={best_params['trailing']}% "
               f"P={best_params['pyramid_step']}% MP={best_params['max_pyramids']}")
+        print(f"Filter: {min_move_pct}% minimum move (1 basis point)")
 
-    # Create raw tick streamer (downloads if not cached)
-    tick_streamer = create_tick_streamer_raw(coin, years, verbose)
-    num_ticks = count_cached_ticks_raw(coin, years)
+    # Create filtered tick streamer (downloads raw if not cached, then filters)
+    tick_streamer = create_filtered_tick_streamer(coin, years, min_move_pct, verbose)
+
+    # Count ticks for reporting
+    total_ticks, filtered_ticks = count_filtered_ticks(coin, years, min_move_pct)
 
     if verbose:
-        print(f"\nRunning backtest on {num_ticks:,} raw ticks...")
-        print(f"(This may take several minutes)")
+        if total_ticks > 0:
+            reduction = (1 - filtered_ticks / total_ticks) * 100
+            print(f"\nTick data: {total_ticks:,} raw → {filtered_ticks:,} filtered ({reduction:.1f}% reduction)")
+        print(f"Running backtest on {filtered_ticks:,} filtered ticks...")
 
     start_time = time.time()
 
@@ -537,7 +546,7 @@ def verify_with_raw_ticks(
     if max_pyr == 'unlimited':
         max_pyr = 9999
 
-    # Run backtest with raw ticks
+    # Run backtest with filtered ticks
     result = run_pyramid_backtest(
         tick_streamer(),
         threshold_pct=best_params['threshold'],
@@ -550,7 +559,7 @@ def verify_with_raw_ticks(
     elapsed = time.time() - start_time
 
     if verbose:
-        print(f"\n✓ Tick verification completed in {elapsed/60:.1f} minutes")
+        print(f"\n✓ Tick verification completed in {elapsed:.1f} seconds")
         print(f"\n--- TICK-LEVEL RESULTS ---")
         print(f"  Total P&L:     {result['total_pnl']:+.2f}%")
         print(f"  Rounds:        {result['total_rounds']}")
@@ -564,7 +573,8 @@ def verify_with_raw_ticks(
         'win_rate': result['win_rate'],
         'avg_pnl': result['avg_pnl'],
         'avg_pyramids': result['avg_pyramids'],
-        'num_ticks': num_ticks,
+        'num_ticks_raw': total_ticks,
+        'num_ticks_filtered': filtered_ticks,
         'elapsed_seconds': elapsed
     }
 
@@ -625,9 +635,11 @@ def main():
     parser.add_argument("--coins", type=str, default=None, help="Comma-separated coins to test")
     parser.add_argument("--quick-test", action="store_true", help="Use reduced grid for quick testing")
     parser.add_argument("--verify-ticks", action="store_true",
-                        help="Verify best results with raw tick-by-tick data (maximum accuracy)")
+                        help="Verify best results with filtered tick-by-tick data (maximum accuracy)")
     parser.add_argument("--ticks-only", action="store_true",
-                        help="Skip grid search, run ONLY with raw tick data (very slow but most accurate)")
+                        help="Skip grid search, run ONLY with filtered tick data")
+    parser.add_argument("--tick-filter", type=float, default=0.01,
+                        help="Minimum price move %% to include in tick data (default: 0.01%% = 1 basis point)")
     args = parser.parse_args()
 
     print("=" * 70)
@@ -716,7 +728,8 @@ def main():
         print("\n" + "=" * 70)
         print("PHASE 3: TICK-BY-TICK VERIFICATION")
         print("=" * 70)
-        print("Verifying best parameters with raw tick data (every single trade)")
+        print(f"Verifying best parameters with filtered tick data")
+        print(f"Filter: {args.tick_filter}% minimum move (keeps significant price changes)")
         print("This provides maximum simulation accuracy.\n")
 
         tick_results = {}
@@ -726,6 +739,7 @@ def main():
                     coin,
                     result.best_result,
                     years,
+                    min_move_pct=args.tick_filter,
                     verbose=True
                 )
                 tick_results[coin] = tick_result
