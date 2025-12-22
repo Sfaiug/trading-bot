@@ -34,7 +34,8 @@ from data.tick_data_fetcher import (
     create_tick_streamer_raw,
     count_cached_ticks_raw,
     create_filtered_tick_streamer,
-    count_filtered_ticks
+    count_filtered_ticks,
+    aggregate_ticks_to_interval
 )
 from backtest_pyramid import run_pyramid_backtest, PyramidRound
 from analytics import (
@@ -53,12 +54,14 @@ THRESHOLDS = [float(i) for i in range(1, 21)]  # 1-20%
 TRAILINGS = [1.0 + 0.2 * i for i in range(21)]  # 1-5% in 0.2 steps
 PYRAMID_STEPS = [1.0 + 0.2 * i for i in range(11)]  # 1-3% in 0.2 steps
 MAX_PYRAMIDS = [5, 10, 20, 40, 80, 160, 320, 640, 9999]  # 9999 = unlimited
+POLL_INTERVALS = [0, 0.1, 0.2, 0.4, 0.8, 1.6, 3.2, 6.4]  # 0 = tick-by-tick (live)
 
 # Grid parameters - QUICK TEST
 THRESHOLDS_QUICK = [1, 3, 5, 10, 15]
 TRAILINGS_QUICK = [1.0, 2.0, 3.0, 4.0]
 PYRAMID_STEPS_QUICK = [1.0, 2.0, 3.0]
 MAX_PYRAMIDS_QUICK = [10, 40, 160]
+POLL_INTERVALS_QUICK = [0, 0.4, 1.6, 6.4]  # Subset for quick testing
 
 TOP_N = 10
 REFINED_COMBOS = 500
@@ -95,37 +98,39 @@ def rounds_to_summaries(rounds: List[PyramidRound]) -> List[RoundSummary]:
 
 def run_grid_search(
     coin: str,
-    price_streamer: Callable,
+    tick_streamer: Callable,
     thresholds: List[float],
     trailings: List[float],
     pyramid_steps: List[float],
-    max_pyramids_list: List[int]
+    max_pyramids_list: List[int],
+    poll_intervals: List[float]
 ) -> Tuple[str, List[Dict]]:
     """
-    Run grid search over all parameter combinations.
+    Run grid search over all parameter combinations including poll intervals.
 
     Memory-efficient: streams prices from disk for each backtest,
     only keeps top N results in memory.
 
     Args:
         coin: Trading pair symbol
-        price_streamer: Callable that returns a generator of (timestamp, price)
+        tick_streamer: Callable that returns a generator of (timestamp, price) tick data
         thresholds: List of threshold percentages to test
         trailings: List of trailing stop percentages to test
         pyramid_steps: List of pyramid step percentages to test
         max_pyramids_list: List of max pyramid counts to test
+        poll_intervals: List of polling intervals in seconds (0 = tick-by-tick)
 
     Returns:
         Tuple of (log_file_path, top_10_results)
     """
-    total = len(thresholds) * len(trailings) * len(pyramid_steps) * len(max_pyramids_list)
+    total = len(thresholds) * len(trailings) * len(pyramid_steps) * len(max_pyramids_list) * len(poll_intervals)
     top_results = []  # Only keep top N in memory
 
     log_file = os.path.join(LOG_DIR, f"{coin}_pyramid_v2_grid.csv")
 
     with open(log_file, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=[
-            'threshold', 'trailing', 'pyramid_step', 'max_pyramids',
+            'threshold', 'trailing', 'pyramid_step', 'max_pyramids', 'poll_interval',
             'total_pnl', 'rounds', 'avg_pnl', 'win_rate', 'avg_pyramids'
         ])
         writer.writeheader()
@@ -133,58 +138,69 @@ def run_grid_search(
         completed = 0
         start = time.time()
 
-        for threshold in thresholds:
-            for trailing in trailings:
-                for pyramid_step in pyramid_steps:
-                    for max_pyr in max_pyramids_list:
-                        completed += 1
+        for poll_interval in poll_intervals:
+            poll_label = "tick" if poll_interval == 0 else f"{poll_interval}s"
+            print(f"\n  Testing poll interval: {poll_label}")
 
-                        elapsed = time.time() - start
-                        rate = completed / elapsed if elapsed > 0 else 1
-                        remaining = (total - completed) / rate
+            for threshold in thresholds:
+                for trailing in trailings:
+                    for pyramid_step in pyramid_steps:
+                        for max_pyr in max_pyramids_list:
+                            completed += 1
 
-                        if completed % 100 == 0 or completed == 1:
-                            pct = (completed / total) * 100
-                            print(f"\r  [{completed:,}/{total:,}] {pct:.1f}% | {remaining/3600:.1f}h remaining    ",
-                                  end="", flush=True)
+                            elapsed = time.time() - start
+                            rate = completed / elapsed if elapsed > 0 else 1
+                            remaining = (total - completed) / rate
 
-                        try:
-                            # Stream prices from disk for this backtest
-                            result = run_pyramid_backtest(
-                                price_streamer(),  # Fresh generator for each backtest
-                                threshold_pct=threshold,
-                                trailing_pct=trailing,
-                                pyramid_step_pct=pyramid_step,
-                                max_pyramids=max_pyr,
-                                verbose=False
-                            )
+                            if completed % 100 == 0 or completed == 1:
+                                pct = (completed / total) * 100
+                                print(f"\r    [{completed:,}/{total:,}] {pct:.1f}% | {remaining/3600:.1f}h remaining    ",
+                                      end="", flush=True)
 
-                            entry = {
-                                'threshold': threshold,
-                                'trailing': trailing,
-                                'pyramid_step': pyramid_step,
-                                'max_pyramids': max_pyr if max_pyr < 9999 else 'unlimited',
-                                'total_pnl': result['total_pnl'],
-                                'rounds': result['total_rounds'],
-                                'avg_pnl': result['avg_pnl'],
-                                'win_rate': result['win_rate'],
-                                'avg_pyramids': result['avg_pyramids']
-                            }
+                            try:
+                                # Aggregate tick data to the poll interval
+                                price_stream = aggregate_ticks_to_interval(
+                                    tick_streamer,
+                                    poll_interval
+                                )
 
-                            # Write immediately to disk
-                            writer.writerow(entry)
-                            f.flush()
+                                # Run backtest on aggregated stream
+                                result = run_pyramid_backtest(
+                                    price_stream,
+                                    threshold_pct=threshold,
+                                    trailing_pct=trailing,
+                                    pyramid_step_pct=pyramid_step,
+                                    max_pyramids=max_pyr,
+                                    verbose=False
+                                )
 
-                            # Maintain only top N in memory (sorted insert)
-                            if len(top_results) < TOP_N:
-                                top_results.append(entry)
-                                top_results.sort(key=lambda x: x['total_pnl'], reverse=True)
-                            elif entry['total_pnl'] > top_results[-1]['total_pnl']:
-                                top_results[-1] = entry
-                                top_results.sort(key=lambda x: x['total_pnl'], reverse=True)
+                                entry = {
+                                    'threshold': threshold,
+                                    'trailing': trailing,
+                                    'pyramid_step': pyramid_step,
+                                    'max_pyramids': max_pyr if max_pyr < 9999 else 'unlimited',
+                                    'poll_interval': poll_label,
+                                    'total_pnl': result['total_pnl'],
+                                    'rounds': result['total_rounds'],
+                                    'avg_pnl': result['avg_pnl'],
+                                    'win_rate': result['win_rate'],
+                                    'avg_pyramids': result['avg_pyramids']
+                                }
 
-                        except Exception as e:
-                            print(f"\n  Error: {e}")
+                                # Write immediately to disk
+                                writer.writerow(entry)
+                                f.flush()
+
+                                # Maintain only top N in memory (sorted insert)
+                                if len(top_results) < TOP_N:
+                                    top_results.append(entry)
+                                    top_results.sort(key=lambda x: x['total_pnl'], reverse=True)
+                                elif entry['total_pnl'] > top_results[-1]['total_pnl']:
+                                    top_results[-1] = entry
+                                    top_results.sort(key=lambda x: x['total_pnl'], reverse=True)
+
+                            except Exception as e:
+                                print(f"\n  Error: {e}")
 
     print()
     return log_file, top_results
@@ -192,18 +208,18 @@ def run_grid_search(
 
 def run_refined_search(
     coin: str,
-    price_streamer: Callable,
+    tick_streamer: Callable,
     top_results: List[Dict]
 ) -> Tuple[str, Dict]:
     """
-    Refine search around top results.
+    Refine search around top results including poll_interval.
 
     Memory-efficient: streams prices from disk for each backtest,
     only keeps the single best result in memory.
 
     Args:
         coin: Trading pair symbol
-        price_streamer: Callable that returns a generator of (timestamp, price)
+        tick_streamer: Callable that returns a generator of (timestamp, price) tick data
         top_results: Top N results from grid search to refine around
 
     Returns:
@@ -215,8 +231,8 @@ def run_refined_search(
 
     with open(log_file, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=[
-            'base_threshold', 'base_trailing', 'base_pyramid', 'base_max_pyr',
-            'threshold', 'trailing', 'pyramid_step', 'max_pyramids',
+            'base_threshold', 'base_trailing', 'base_pyramid', 'base_max_pyr', 'base_poll',
+            'threshold', 'trailing', 'pyramid_step', 'max_pyramids', 'poll_interval',
             'total_pnl', 'rounds', 'avg_pnl', 'win_rate', 'avg_pyramids'
         ])
         writer.writeheader()
@@ -226,12 +242,19 @@ def run_refined_search(
             base_tr = top['trailing']
             base_p = top['pyramid_step']
             base_mp = top['max_pyramids']
+            base_poll = top.get('poll_interval', '1.0s')
 
             # Handle 'unlimited' string
             if base_mp == 'unlimited':
                 base_mp = 9999
 
-            print(f"\n  Refining #{rank}: {base_t}% / {base_tr}% / {base_p}% / {base_mp} pyramids")
+            # Parse poll interval from string (e.g., "tick" or "0.4s")
+            if base_poll == 'tick':
+                base_poll_val = 0
+            else:
+                base_poll_val = float(base_poll.replace('s', ''))
+
+            print(f"\n  Refining #{rank}: {base_t}% / {base_tr}% / {base_p}% / {base_mp} pyramids / {base_poll}")
 
             # Generate refined grid around this point
             thresholds = [round(base_t + 0.1 * i, 1) for i in range(-5, 6) if base_t + 0.1 * i > 0]
@@ -246,55 +269,73 @@ def run_refined_search(
                 mp_high = min(9999, int(base_mp * 2))
                 max_pyr_variants = sorted(set([mp_low, base_mp, mp_high]))
 
-            total = len(thresholds) * len(trailings) * len(pyramids) * len(max_pyr_variants)
+            # For poll_interval, test nearby values
+            if base_poll_val == 0:
+                poll_variants = [0, 0.1, 0.2]  # tick and nearby
+            elif base_poll_val >= 3.2:
+                poll_variants = [base_poll_val / 2, base_poll_val, base_poll_val * 2]
+            else:
+                poll_variants = [max(0, base_poll_val / 2), base_poll_val, base_poll_val * 2]
+
+            total = len(thresholds) * len(trailings) * len(pyramids) * len(max_pyr_variants) * len(poll_variants)
             completed = 0
 
-            for threshold in thresholds:
-                for trailing in trailings:
-                    for pyramid_step in pyramids:
-                        for max_pyr in max_pyr_variants:
-                            completed += 1
+            for poll_interval in poll_variants:
+                poll_label = "tick" if poll_interval == 0 else f"{poll_interval}s"
 
-                            if completed % 100 == 0:
-                                print(f"\r    [{completed}/{total}]    ", end="", flush=True)
+                for threshold in thresholds:
+                    for trailing in trailings:
+                        for pyramid_step in pyramids:
+                            for max_pyr in max_pyr_variants:
+                                completed += 1
 
-                            try:
-                                # Stream prices from disk for this backtest
-                                result = run_pyramid_backtest(
-                                    price_streamer(),  # Fresh generator for each backtest
-                                    threshold_pct=threshold,
-                                    trailing_pct=trailing,
-                                    pyramid_step_pct=pyramid_step,
-                                    max_pyramids=max_pyr,
-                                    verbose=False
-                                )
+                                if completed % 100 == 0:
+                                    print(f"\r    [{completed}/{total}]    ", end="", flush=True)
 
-                                entry = {
-                                    'base_threshold': base_t,
-                                    'base_trailing': base_tr,
-                                    'base_pyramid': base_p,
-                                    'base_max_pyr': base_mp if base_mp < 9999 else 'unlimited',
-                                    'threshold': threshold,
-                                    'trailing': trailing,
-                                    'pyramid_step': pyramid_step,
-                                    'max_pyramids': max_pyr if max_pyr < 9999 else 'unlimited',
-                                    'total_pnl': result['total_pnl'],
-                                    'rounds': result['total_rounds'],
-                                    'avg_pnl': result['avg_pnl'],
-                                    'win_rate': result['win_rate'],
-                                    'avg_pyramids': result['avg_pyramids']
-                                }
+                                try:
+                                    # Aggregate tick data to the poll interval
+                                    price_stream = aggregate_ticks_to_interval(
+                                        tick_streamer,
+                                        poll_interval
+                                    )
 
-                                # Write immediately to disk
-                                writer.writerow(entry)
-                                f.flush()
+                                    result = run_pyramid_backtest(
+                                        price_stream,
+                                        threshold_pct=threshold,
+                                        trailing_pct=trailing,
+                                        pyramid_step_pct=pyramid_step,
+                                        max_pyramids=max_pyr,
+                                        verbose=False
+                                    )
 
-                                # Track only the best result
-                                if best_result is None or entry['total_pnl'] > best_result['total_pnl']:
-                                    best_result = entry
+                                    entry = {
+                                        'base_threshold': base_t,
+                                        'base_trailing': base_tr,
+                                        'base_pyramid': base_p,
+                                        'base_max_pyr': base_mp if base_mp < 9999 else 'unlimited',
+                                        'base_poll': base_poll,
+                                        'threshold': threshold,
+                                        'trailing': trailing,
+                                        'pyramid_step': pyramid_step,
+                                        'max_pyramids': max_pyr if max_pyr < 9999 else 'unlimited',
+                                        'poll_interval': poll_label,
+                                        'total_pnl': result['total_pnl'],
+                                        'rounds': result['total_rounds'],
+                                        'avg_pnl': result['avg_pnl'],
+                                        'win_rate': result['win_rate'],
+                                        'avg_pyramids': result['avg_pyramids']
+                                    }
 
-                            except:
-                                pass
+                                    # Write immediately to disk
+                                    writer.writerow(entry)
+                                    f.flush()
+
+                                    # Track only the best result
+                                    if best_result is None or entry['total_pnl'] > best_result['total_pnl']:
+                                        best_result = entry
+
+                                except:
+                                    pass
 
             print()
 
@@ -303,20 +344,20 @@ def run_refined_search(
 
 def process_coin(
     coin: str,
-    price_streamer: Callable,
-    num_prices: int,
+    tick_streamer: Callable,
+    num_ticks: int,
     quick_test: bool = False
 ) -> CoinResult:
     """
     Process a single coin through grid search and refinement.
 
-    Memory-efficient: uses price_streamer to stream data from disk
-    for each backtest, avoiding loading all prices into memory.
+    Memory-efficient: uses tick_streamer to stream data from disk
+    for each backtest, avoiding loading all ticks into memory.
 
     Args:
         coin: Trading pair symbol
-        price_streamer: Callable that returns a generator of (timestamp, price)
-        num_prices: Number of prices in the dataset (for display)
+        tick_streamer: Callable that returns a generator of (timestamp, price) tick data
+        num_ticks: Number of ticks in the dataset (for display)
         quick_test: Use reduced grid for quick testing
 
     Returns:
@@ -325,7 +366,7 @@ def process_coin(
     print(f"\n{'#' * 70}")
     print(f"# PROCESSING: {coin}")
     print(f"{'#' * 70}")
-    print(f"Data: {num_prices:,} price points (streaming from disk)")
+    print(f"Data: {num_ticks:,} filtered ticks (streaming from disk)")
 
     # Select grid parameters
     if quick_test:
@@ -333,18 +374,23 @@ def process_coin(
         trailings = TRAILINGS_QUICK
         pyramid_steps = PYRAMID_STEPS_QUICK
         max_pyramids = MAX_PYRAMIDS_QUICK
+        poll_intervals = POLL_INTERVALS_QUICK
     else:
         thresholds = THRESHOLDS
         trailings = TRAILINGS
         pyramid_steps = PYRAMID_STEPS
         max_pyramids = MAX_PYRAMIDS
+        poll_intervals = POLL_INTERVALS
 
-    total_combos = len(thresholds) * len(trailings) * len(pyramid_steps) * len(max_pyramids)
+    total_combos = len(thresholds) * len(trailings) * len(pyramid_steps) * len(max_pyramids) * len(poll_intervals)
 
     # Grid search
     print(f"\n--- Grid Search ({total_combos:,} combinations) ---")
+    print(f"  Poll intervals: {['tick' if p==0 else f'{p}s' for p in poll_intervals]}")
     start = time.time()
-    grid_log_file, top_10 = run_grid_search(coin, price_streamer, thresholds, trailings, pyramid_steps, max_pyramids)
+    grid_log_file, top_10 = run_grid_search(
+        coin, tick_streamer, thresholds, trailings, pyramid_steps, max_pyramids, poll_intervals
+    )
     print(f"  ✓ Completed in {(time.time()-start)/60:.1f} minutes")
 
     # Save top 10
@@ -357,22 +403,37 @@ def process_coin(
     print(f"\n--- Top {TOP_N} ---")
     for i, r in enumerate(top_10, 1):
         mp = r['max_pyramids']
-        print(f"  #{i}: T={r['threshold']}% Tr={r['trailing']}% P={r['pyramid_step']}% MP={mp} → {r['total_pnl']:+.2f}%")
+        poll = r.get('poll_interval', '1s')
+        print(f"  #{i}: T={r['threshold']}% Tr={r['trailing']}% P={r['pyramid_step']}% MP={mp} Poll={poll} → {r['total_pnl']:+.2f}%")
 
     # Refined search
     print(f"\n--- Refined Search ---")
     start = time.time()
-    refined_log_file, best = run_refined_search(coin, price_streamer, top_10)
+    refined_log_file, best = run_refined_search(coin, tick_streamer, top_10)
     print(f"  ✓ Completed in {(time.time()-start)/60:.1f} minutes")
 
     # Fall back to top grid result if refined search found nothing better
     if best is None:
-        best = top_10[0] if top_10 else {'threshold': 5, 'trailing': 2, 'pyramid_step': 2, 'max_pyramids': 20, 'total_pnl': 0, 'win_rate': 0}
+        best = top_10[0] if top_10 else {
+            'threshold': 5, 'trailing': 2, 'pyramid_step': 2,
+            'max_pyramids': 20, 'poll_interval': '1.0s',
+            'total_pnl': 0, 'win_rate': 0
+        }
 
     # Run best config again to get full rounds for analytics
     best_max_pyr = best['max_pyramids'] if best['max_pyramids'] != 'unlimited' else 9999
+
+    # Parse poll interval for final run
+    best_poll = best.get('poll_interval', '1.0s')
+    if best_poll == 'tick':
+        best_poll_val = 0
+    else:
+        best_poll_val = float(best_poll.replace('s', ''))
+
+    # Aggregate ticks to best poll interval and run
+    price_stream = aggregate_ticks_to_interval(tick_streamer, best_poll_val)
     best_result = run_pyramid_backtest(
-        price_streamer(),  # Stream from disk one more time
+        price_stream,
         threshold_pct=best['threshold'],
         trailing_pct=best['trailing'],
         pyramid_step_pct=best['pyramid_step'],
@@ -394,6 +455,7 @@ def process_coin(
     print(f"   Trailing:     {best['trailing']}%")
     print(f"   Pyramid Step: {best['pyramid_step']}%")
     print(f"   Max Pyramids: {best['max_pyramids']}")
+    print(f"   Poll Interval:{best.get('poll_interval', '1.0s')}")
     print(f"   Total P&L:    {best['total_pnl']:+.2f}%")
     print(f"   Win Rate:     {best['win_rate']:.1f}%")
 
@@ -405,35 +467,37 @@ def process_coin(
 
 def print_final_report(results: Dict[str, CoinResult], years: int):
     """Print and save comprehensive final report."""
-    print("\n" + "=" * 100)
+    print("\n" + "=" * 115)
     print("ENHANCED PYRAMID STRATEGY - FINAL RECOMMENDATIONS")
-    print("=" * 100)
+    print("=" * 115)
     print(f"Data period: {years} year(s) of tick data")
     print()
-    
+
     # Header
-    print(f"{'Coin':<10} {'Threshold':<10} {'Trailing':<10} {'PyrStep':<10} {'MaxPyr':<10} "
+    print(f"{'Coin':<10} {'Threshold':<10} {'Trailing':<10} {'PyrStep':<10} {'MaxPyr':<10} {'Poll':<10} "
           f"{'P&L':<10} {'WinRate':<10} {'MaxDD':<10} {'MinAcct':<12}")
-    print("-" * 100)
+    print("-" * 115)
     
     final_data = []
     
     for coin in results:
         r = results[coin].best_result
         a = results[coin].analytics
-        
+
         mp = r['max_pyramids'] if r['max_pyramids'] != 'unlimited' else '∞'
+        poll = r.get('poll_interval', '1.0s')
         min_acct = a['account_sizing']['recommended_account']
-        
+
         print(f"{coin:<10} {r['threshold']:<10.1f}% {r['trailing']:<10.1f}% {r['pyramid_step']:<10.1f}% "
-              f"{mp:<10} {r['total_pnl']:+8.1f}%  {r['win_rate']:<10.1f}% {a['max_drawdown']:<10.1f}% ${min_acct:<10.0f}")
-        
+              f"{mp:<10} {poll:<10} {r['total_pnl']:+8.1f}%  {r['win_rate']:<10.1f}% {a['max_drawdown']:<10.1f}% ${min_acct:<10.0f}")
+
         final_data.append({
             'coin': coin,
             'threshold': r['threshold'],
             'trailing': r['trailing'],
             'pyramid_step': r['pyramid_step'],
             'max_pyramids': r['max_pyramids'],
+            'poll_interval': poll,
             'total_pnl': r['total_pnl'],
             'avg_pnl': r['avg_pnl'],
             'win_rate': r['win_rate'],
@@ -445,8 +509,8 @@ def print_final_report(results: Dict[str, CoinResult], years: int):
             'profitable_months': a['profitable_months'],
             'total_months': a['total_months']
         })
-    
-    print("-" * 100)
+
+    print("-" * 115)
     
     # Save final recommendations
     with open(os.path.join(LOG_DIR, "pyramid_v2_recommendations.csv"), 'w', newline='') as f:
@@ -484,6 +548,7 @@ def print_final_report(results: Dict[str, CoinResult], years: int):
             f.write(f"  Trailing:      {item['trailing']:.1f}%\n")
             f.write(f"  Pyramid Step:  {item['pyramid_step']:.1f}%\n")
             f.write(f"  Max Pyramids:  {item['max_pyramids']}\n")
+            f.write(f"  Poll Interval: {item['poll_interval']}\n")
             f.write(f"  Total P&L:     {item['total_pnl']:+.2f}%\n")
             f.write(f"  Win Rate:      {item['win_rate']:.1f}%\n")
             f.write(f"  Sharpe Ratio:  {item['sharpe_ratio']:.2f}\n")
@@ -657,37 +722,45 @@ def main():
 
     # Grid info
     if args.quick_test:
-        combos = len(THRESHOLDS_QUICK) * len(TRAILINGS_QUICK) * len(PYRAMID_STEPS_QUICK) * len(MAX_PYRAMIDS_QUICK)
+        combos = len(THRESHOLDS_QUICK) * len(TRAILINGS_QUICK) * len(PYRAMID_STEPS_QUICK) * len(MAX_PYRAMIDS_QUICK) * len(POLL_INTERVALS_QUICK)
+        poll_intervals = POLL_INTERVALS_QUICK
         print("\n[QUICK TEST MODE]")
     else:
-        combos = len(THRESHOLDS) * len(TRAILINGS) * len(PYRAMID_STEPS) * len(MAX_PYRAMIDS)
+        combos = len(THRESHOLDS) * len(TRAILINGS) * len(PYRAMID_STEPS) * len(MAX_PYRAMIDS) * len(POLL_INTERVALS)
+        poll_intervals = POLL_INTERVALS
 
+    poll_labels = ['tick' if p == 0 else f'{p}s' for p in poll_intervals]
     print(f"\nConfiguration:")
-    print(f"  Coins:        {', '.join(coins)}")
-    print(f"  Data:         {years} year(s) of tick data")
-    print(f"  Grid:         {combos:,} combinations per coin")
-    print(f"  Max Pyramids: {MAX_PYRAMIDS if not args.quick_test else MAX_PYRAMIDS_QUICK}")
-    print(f"  Memory Mode:  Streaming (low RAM usage)")
+    print(f"  Coins:          {', '.join(coins)}")
+    print(f"  Data:           {years} year(s) of tick data")
+    print(f"  Grid:           {combos:,} combinations per coin")
+    print(f"  Max Pyramids:   {MAX_PYRAMIDS if not args.quick_test else MAX_PYRAMIDS_QUICK}")
+    print(f"  Poll Intervals: {poll_labels}")
+    print(f"  Memory Mode:    Streaming (low RAM usage)")
     print("=" * 70)
 
     ensure_dirs()
 
-    # Phase 1: Download and cache all data first (sequential to avoid OOM)
+    # Phase 1: Download and cache all tick data first (sequential to avoid OOM)
     print("\n" + "=" * 70)
-    print("PHASE 1: DOWNLOADING & CACHING DATA")
+    print("PHASE 1: DOWNLOADING & CACHING TICK DATA")
     print("=" * 70)
+    print(f"Tick filter: {args.tick_filter}% minimum move")
 
     valid_coins = []
     for i, coin in enumerate(coins, 1):
         print(f"\n[{i}/{len(coins)}] {coin}...")
         try:
-            # This downloads and caches to disk, returning a streamer function
-            price_streamer = create_price_streamer(coin, years=years, verbose=True)
-            num_prices = count_cached_prices(coin, years)
+            # This downloads raw ticks and creates a filtered streamer
+            tick_streamer = create_filtered_tick_streamer(
+                coin, years=years, min_move_pct=args.tick_filter, verbose=True
+            )
+            total_ticks, filtered_ticks = count_filtered_ticks(coin, years, args.tick_filter)
 
-            if num_prices > 1000:
-                valid_coins.append((coin, price_streamer, num_prices))
-                print(f"  ✓ Ready: {num_prices:,} prices cached")
+            if filtered_ticks > 1000:
+                valid_coins.append((coin, tick_streamer, filtered_ticks))
+                reduction = (1 - filtered_ticks / total_ticks) * 100 if total_ticks > 0 else 0
+                print(f"  ✓ Ready: {filtered_ticks:,} filtered ticks ({reduction:.1f}% reduction from {total_ticks:,} raw)")
             else:
                 print(f"  ⚠ Insufficient data for {coin}, skipping")
         except Exception as e:
@@ -707,11 +780,11 @@ def main():
     all_results = {}
     total_start = time.time()
 
-    for i, (coin, price_streamer, num_prices) in enumerate(valid_coins, 1):
+    for i, (coin, tick_streamer, num_ticks) in enumerate(valid_coins, 1):
         print(f"\n[{i}/{len(valid_coins)}] Processing {coin}...")
 
         # Process this coin (streams from disk, minimal RAM)
-        result = process_coin(coin, price_streamer, num_prices, quick_test=args.quick_test)
+        result = process_coin(coin, tick_streamer, num_ticks, quick_test=args.quick_test)
         all_results[coin] = result
 
         # Explicit garbage collection between coins to release any lingering memory

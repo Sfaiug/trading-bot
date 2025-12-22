@@ -733,6 +733,93 @@ def count_cached_ticks_raw(symbol: str, years: int) -> int:
         return sum(1 for _ in f)
 
 
+def aggregate_ticks_to_interval(
+    tick_streamer: callable,
+    interval_seconds: float
+) -> Generator[Tuple[datetime, float], None, None]:
+    """
+    Aggregate tick data to custom time intervals.
+
+    Args:
+        tick_streamer: Callable that returns generator of (datetime, price) tuples
+        interval_seconds: Aggregation interval in seconds.
+                         0 = tick-by-tick (pass through all ticks)
+                         >0 = aggregate to VWAP for each interval
+
+    Yields:
+        (datetime, price) tuples at the specified interval
+
+    Examples:
+        interval_seconds=0    -> every tick (live mode)
+        interval_seconds=0.1  -> 100ms aggregation
+        interval_seconds=1.0  -> 1 second aggregation
+        interval_seconds=6.4  -> 6.4 second aggregation
+    """
+    if interval_seconds == 0:
+        # Tick mode - pass through all ticks
+        yield from tick_streamer()
+        return
+
+    # Aggregate to intervals
+    current_window_start = None
+    window_prices = []
+
+    for ts, price in tick_streamer():
+        # Calculate window start time
+        # For sub-second intervals, use microseconds
+        if interval_seconds < 1:
+            # Convert to microseconds for precision
+            total_micros = ts.hour * 3600_000_000 + ts.minute * 60_000_000 + ts.second * 1_000_000 + ts.microsecond
+            interval_micros = int(interval_seconds * 1_000_000)
+            window_micros = (total_micros // interval_micros) * interval_micros
+
+            window_second = (window_micros // 1_000_000) % 60
+            window_minute = (window_micros // 60_000_000) % 60
+            window_hour = (window_micros // 3600_000_000) % 24
+            window_micro = window_micros % 1_000_000
+
+            window_start = ts.replace(
+                hour=window_hour,
+                minute=window_minute,
+                second=window_second,
+                microsecond=window_micro
+            )
+        else:
+            # For >= 1 second intervals
+            total_seconds = ts.hour * 3600 + ts.minute * 60 + ts.second
+            window_seconds = int((total_seconds // interval_seconds) * interval_seconds)
+
+            window_hour = window_seconds // 3600
+            window_minute = (window_seconds % 3600) // 60
+            window_second = window_seconds % 60
+
+            window_start = ts.replace(
+                hour=window_hour,
+                minute=window_minute,
+                second=window_second,
+                microsecond=0
+            )
+
+        if current_window_start is None:
+            current_window_start = window_start
+
+        if window_start != current_window_start:
+            # Emit average price for completed window
+            if window_prices:
+                avg_price = sum(window_prices) / len(window_prices)
+                yield (current_window_start, avg_price)
+
+            current_window_start = window_start
+            window_prices = []
+
+        window_prices.append(price)
+
+    # Emit final window
+    if window_prices:
+        avg_price = sum(window_prices) / len(window_prices)
+        yield (current_window_start, avg_price)
+
+
 def aggregate_trades(trades: List[Trade], window_seconds: float) -> List[Tuple[datetime, float]]:
     """
     Aggregate trades using VWAP within time windows.
