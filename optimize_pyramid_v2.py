@@ -30,7 +30,9 @@ from data.tick_data_fetcher import (
     fetch_tick_data,
     get_years_from_user,
     create_price_streamer,
-    count_cached_prices
+    count_cached_prices,
+    create_tick_streamer_raw,
+    count_cached_ticks_raw
 )
 from backtest_pyramid import run_pyramid_backtest, PyramidRound
 from analytics import (
@@ -492,12 +494,140 @@ def print_final_report(results: Dict[str, CoinResult], years: int):
     print(f"  - [COIN]_monthly_breakdown.csv")
 
 
+def verify_with_raw_ticks(
+    coin: str,
+    best_params: Dict,
+    years: int,
+    verbose: bool = True
+) -> Dict:
+    """
+    Verify best parameters using raw tick-by-tick data.
+
+    This provides maximum accuracy by using every single trade,
+    rather than 1-second aggregated data.
+
+    Args:
+        coin: Trading pair symbol
+        best_params: Best parameters from grid search
+        years: Number of years of data
+        verbose: Print progress
+
+    Returns:
+        Dict with tick-level backtest results for comparison
+    """
+    if verbose:
+        print(f"\n{'='*60}")
+        print(f"TICK-BY-TICK VERIFICATION: {coin}")
+        print(f"{'='*60}")
+        print(f"Parameters: T={best_params['threshold']}% Tr={best_params['trailing']}% "
+              f"P={best_params['pyramid_step']}% MP={best_params['max_pyramids']}")
+
+    # Create raw tick streamer (downloads if not cached)
+    tick_streamer = create_tick_streamer_raw(coin, years, verbose)
+    num_ticks = count_cached_ticks_raw(coin, years)
+
+    if verbose:
+        print(f"\nRunning backtest on {num_ticks:,} raw ticks...")
+        print(f"(This may take several minutes)")
+
+    start_time = time.time()
+
+    # Get max_pyramids value
+    max_pyr = best_params['max_pyramids']
+    if max_pyr == 'unlimited':
+        max_pyr = 9999
+
+    # Run backtest with raw ticks
+    result = run_pyramid_backtest(
+        tick_streamer(),
+        threshold_pct=best_params['threshold'],
+        trailing_pct=best_params['trailing'],
+        pyramid_step_pct=best_params['pyramid_step'],
+        max_pyramids=max_pyr,
+        verbose=False
+    )
+
+    elapsed = time.time() - start_time
+
+    if verbose:
+        print(f"\n✓ Tick verification completed in {elapsed/60:.1f} minutes")
+        print(f"\n--- TICK-LEVEL RESULTS ---")
+        print(f"  Total P&L:     {result['total_pnl']:+.2f}%")
+        print(f"  Rounds:        {result['total_rounds']}")
+        print(f"  Win Rate:      {result['win_rate']:.1f}%")
+        print(f"  Avg P&L:       {result['avg_pnl']:+.2f}%")
+        print(f"  Avg Pyramids:  {result['avg_pyramids']:.1f}")
+
+    return {
+        'total_pnl': result['total_pnl'],
+        'total_rounds': result['total_rounds'],
+        'win_rate': result['win_rate'],
+        'avg_pnl': result['avg_pnl'],
+        'avg_pyramids': result['avg_pyramids'],
+        'num_ticks': num_ticks,
+        'elapsed_seconds': elapsed
+    }
+
+
+def print_verification_comparison(
+    coin: str,
+    aggregated_result: Dict,
+    tick_result: Dict
+):
+    """Print comparison between aggregated and tick-level results."""
+    print(f"\n{'='*60}")
+    print(f"COMPARISON: {coin}")
+    print(f"{'='*60}")
+    print(f"{'Metric':<20} {'1s Aggregated':>15} {'Tick-by-Tick':>15} {'Difference':>12}")
+    print("-" * 62)
+
+    metrics = [
+        ('Total P&L', 'total_pnl', '%'),
+        ('Rounds', 'total_rounds', ''),
+        ('Win Rate', 'win_rate', '%'),
+        ('Avg P&L', 'avg_pnl', '%'),
+        ('Avg Pyramids', 'avg_pyramids', ''),
+    ]
+
+    for label, key, suffix in metrics:
+        agg_val = aggregated_result.get(key, 0)
+        tick_val = tick_result.get(key, 0)
+
+        if key in ['total_pnl', 'win_rate', 'avg_pnl']:
+            diff = tick_val - agg_val
+            diff_str = f"{diff:+.2f}{suffix}"
+            agg_str = f"{agg_val:.2f}{suffix}"
+            tick_str = f"{tick_val:.2f}{suffix}"
+        else:
+            diff = tick_val - agg_val
+            diff_str = f"{diff:+.1f}"
+            agg_str = f"{agg_val:.1f}"
+            tick_str = f"{tick_val:.1f}"
+
+        print(f"{label:<20} {agg_str:>15} {tick_str:>15} {diff_str:>12}")
+
+    print("-" * 62)
+
+    # Summary assessment
+    pnl_diff_pct = abs(tick_result['total_pnl'] - aggregated_result['total_pnl'])
+    if pnl_diff_pct < 1:
+        print("✓ Results are consistent (< 1% difference in total P&L)")
+    elif pnl_diff_pct < 5:
+        print("⚠ Minor difference (1-5% in total P&L)")
+    else:
+        print("⚠ Significant difference (> 5% in total P&L) - tick data may reveal different patterns")
+
+
 def main():
     import argparse
 
     parser = argparse.ArgumentParser(description="Enhanced Pyramid Strategy Optimizer v2 (Memory-Optimized)")
     parser.add_argument("--coins", type=str, default=None, help="Comma-separated coins to test")
     parser.add_argument("--quick-test", action="store_true", help="Use reduced grid for quick testing")
+    parser.add_argument("--verify-ticks", action="store_true",
+                        help="Verify best results with raw tick-by-tick data (maximum accuracy)")
+    parser.add_argument("--ticks-only", action="store_true",
+                        help="Skip grid search, run ONLY with raw tick data (very slow but most accurate)")
     args = parser.parse_args()
 
     print("=" * 70)
@@ -580,6 +710,63 @@ def main():
 
     # Final report
     print_final_report(all_results, years)
+
+    # Phase 3: Tick-by-tick verification (if requested)
+    if args.verify_ticks or args.ticks_only:
+        print("\n" + "=" * 70)
+        print("PHASE 3: TICK-BY-TICK VERIFICATION")
+        print("=" * 70)
+        print("Verifying best parameters with raw tick data (every single trade)")
+        print("This provides maximum simulation accuracy.\n")
+
+        tick_results = {}
+        for coin, result in all_results.items():
+            try:
+                tick_result = verify_with_raw_ticks(
+                    coin,
+                    result.best_result,
+                    years,
+                    verbose=True
+                )
+                tick_results[coin] = tick_result
+
+                # Print comparison
+                print_verification_comparison(
+                    coin,
+                    result.best_result,
+                    tick_result
+                )
+
+                gc.collect()
+            except Exception as e:
+                print(f"  ✗ Error verifying {coin}: {e}")
+
+        # Save tick verification results
+        if tick_results:
+            tick_file = os.path.join(LOG_DIR, "pyramid_v2_tick_verification.csv")
+            with open(tick_file, 'w', newline='') as f:
+                fieldnames = ['coin', 'total_pnl_1s', 'total_pnl_tick', 'pnl_diff',
+                              'rounds_1s', 'rounds_tick', 'win_rate_1s', 'win_rate_tick',
+                              'num_ticks', 'verification_time_min']
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+
+                for coin, tick_res in tick_results.items():
+                    agg_res = all_results[coin].best_result
+                    writer.writerow({
+                        'coin': coin,
+                        'total_pnl_1s': round(agg_res['total_pnl'], 2),
+                        'total_pnl_tick': round(tick_res['total_pnl'], 2),
+                        'pnl_diff': round(tick_res['total_pnl'] - agg_res['total_pnl'], 2),
+                        'rounds_1s': agg_res.get('rounds', agg_res.get('total_rounds', 0)),
+                        'rounds_tick': tick_res['total_rounds'],
+                        'win_rate_1s': round(agg_res['win_rate'], 1),
+                        'win_rate_tick': round(tick_res['win_rate'], 1),
+                        'num_ticks': tick_res['num_ticks'],
+                        'verification_time_min': round(tick_res['elapsed_seconds'] / 60, 1)
+                    })
+
+            print(f"\n✓ Tick verification saved to {tick_file}")
 
     print()
     print("=" * 70)

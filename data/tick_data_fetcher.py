@@ -407,6 +407,206 @@ def count_cached_prices(symbol: str, years: int, aggregate_seconds: float = 1.0)
         return sum(1 for _ in f)
 
 
+def get_tick_cache_path(symbol: str, years: int) -> str:
+    """Get path to raw tick cache file (no aggregation)."""
+    return os.path.join(CACHE_DIR, f"{symbol}_{years}yr_ticks.csv")
+
+
+def download_raw_ticks_to_file(
+    symbol: str,
+    year: int,
+    month: int,
+    output_file
+) -> int:
+    """
+    Download raw trades for a month and write directly to file.
+
+    Memory-efficient: streams from ZIP directly to output file.
+
+    Args:
+        symbol: Trading pair
+        year: Year
+        month: Month
+        output_file: Open file handle to write to
+
+    Returns:
+        Number of trades written, or -1 if download failed.
+    """
+    url = f"{BASE_URL}/{symbol}/{symbol}-trades-{year}-{month:02d}.zip"
+
+    try:
+        response = requests.get(url, timeout=300, stream=True)
+        if response.status_code == 404:
+            return -1
+        response.raise_for_status()
+
+        # Download with progress
+        total_size = int(response.headers.get('content-length', 0))
+        chunks = []
+        downloaded = 0
+
+        for chunk in response.iter_content(chunk_size=8192):
+            chunks.append(chunk)
+            downloaded += len(chunk)
+            if total_size > 0:
+                mb_down = downloaded / (1024 * 1024)
+                mb_total = total_size / (1024 * 1024)
+                pct = (downloaded / total_size) * 100
+                print(f"\r    Downloading: {mb_down:.1f}/{mb_total:.1f} MB ({pct:.0f}%)    ", end="", flush=True)
+
+        content = b''.join(chunks)
+        del chunks
+        print("\r" + " " * 60 + "\r", end="", flush=True)
+
+        # Stream through ZIP and write each trade directly
+        trade_count = 0
+
+        with zipfile.ZipFile(BytesIO(content)) as zf:
+            csv_name = zf.namelist()[0]
+            with zf.open(csv_name) as csv_file:
+                first_line = True
+                for raw_line in csv_file:
+                    if first_line:
+                        first_line = False
+                        continue
+
+                    try:
+                        line = raw_line.decode('utf-8').strip()
+                        parts = line.split(',')
+                        if len(parts) >= 6:
+                            # Extract timestamp (ms) and price
+                            ts_ms = int(parts[4])
+                            price = float(parts[1])
+
+                            # Write as: timestamp_ms,price
+                            output_file.write(f"{ts_ms},{price}\n")
+                            trade_count += 1
+                    except:
+                        continue
+
+        del content
+        return trade_count
+
+    except Exception as e:
+        print(f"Error downloading {symbol} {year}-{month:02d}: {e}")
+        return -1
+
+
+def ensure_cached_tick_data_raw(
+    symbol: str,
+    years: int = 3,
+    verbose: bool = True
+) -> str:
+    """
+    Ensure RAW tick data (no aggregation) is downloaded and cached.
+
+    Downloads all trades and stores them as-is for maximum accuracy.
+    Warning: This creates LARGE files (~50-80 GB per coin for 5 years).
+
+    Args:
+        symbol: Trading pair
+        years: Number of years
+        verbose: Print progress
+
+    Returns:
+        Path to the cache file.
+    """
+    ensure_cache_dir()
+    cache_path = get_tick_cache_path(symbol, years)
+
+    # Check if cache already exists
+    if os.path.exists(cache_path):
+        if verbose:
+            file_size_gb = os.path.getsize(cache_path) / (1024 ** 3)
+            with open(cache_path, 'r') as f:
+                # Count lines efficiently
+                line_count = sum(1 for _ in f)
+            print(f"  ✓ Using cached raw ticks: {line_count:,} trades ({file_size_gb:.1f} GB)")
+        return cache_path
+
+    if verbose:
+        print(f"\n{'='*60}")
+        print(f"DOWNLOADING RAW TICK DATA: {symbol}")
+        print(f"{'='*60}")
+        print(f"Period: {years} year(s), NO aggregation (tick-by-tick)")
+        print(f"⚠️  WARNING: This will create a LARGE cache file!")
+
+    months = get_months_in_range(years)
+    total_trades = 0
+
+    # Write directly to disk as we download each month
+    with open(cache_path, 'w') as f:
+        for i, (year, month) in enumerate(months, 1):
+            if verbose:
+                print(f"  [{i}/{len(months)}] {year}-{month:02d}...", end=" ", flush=True)
+
+            trade_count = download_raw_ticks_to_file(symbol, year, month, f)
+
+            if trade_count < 0:
+                if verbose:
+                    print("not available")
+                continue
+
+            total_trades += trade_count
+            f.flush()
+
+            if verbose:
+                print(f"✓ {trade_count:,} raw trades")
+
+    if verbose:
+        file_size_gb = os.path.getsize(cache_path) / (1024 ** 3)
+        print(f"\n{'='*60}")
+        print(f"Total: {total_trades:,} raw trades")
+        print(f"Cached to: {cache_path}")
+        print(f"Cache size: {file_size_gb:.2f} GB")
+        print(f"{'='*60}")
+
+    return cache_path
+
+
+def create_tick_streamer_raw(
+    symbol: str,
+    years: int = 3,
+    verbose: bool = True
+) -> callable:
+    """
+    Create a function that streams RAW ticks from cache.
+
+    Each call returns a generator that yields every single trade.
+    Use for maximum accuracy verification of backtest results.
+
+    Args:
+        symbol: Trading pair
+        years: Number of years
+        verbose: Print progress during cache creation
+
+    Returns:
+        Callable that returns a generator of (datetime, price) tuples.
+    """
+    cache_path = ensure_cached_tick_data_raw(symbol, years, verbose)
+
+    def stream_ticks() -> Generator[Tuple[datetime, float], None, None]:
+        """Generator that streams raw ticks from cache."""
+        with open(cache_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    ts_ms_str, price_str = line.split(',')
+                    ts = datetime.fromtimestamp(int(ts_ms_str) / 1000)
+                    yield (ts, float(price_str))
+
+    return stream_ticks
+
+
+def count_cached_ticks_raw(symbol: str, years: int) -> int:
+    """Count raw ticks in cache without loading into memory."""
+    cache_path = get_tick_cache_path(symbol, years)
+    if not os.path.exists(cache_path):
+        return 0
+    with open(cache_path, 'r') as f:
+        return sum(1 for _ in f)
+
+
 def aggregate_trades(trades: List[Trade], window_seconds: float) -> List[Tuple[datetime, float]]:
     """
     Aggregate trades using VWAP within time windows.
