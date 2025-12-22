@@ -11,7 +11,7 @@ Strategy Logic:
 """
 
 from datetime import datetime
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Iterator, Union, Iterable
 from dataclasses import dataclass, field
 
 
@@ -51,7 +51,7 @@ def calculate_profit_pct(entry_price: float, current_price: float, is_long: bool
 
 
 def run_pyramid_backtest(
-    prices: List[Tuple[datetime, float]],
+    prices: Iterable[Tuple[datetime, float]],
     threshold_pct: float,
     trailing_pct: float,
     pyramid_step_pct: float,
@@ -61,9 +61,9 @@ def run_pyramid_backtest(
 ) -> Dict:
     """
     Run pyramid strategy backtest.
-    
+
     Args:
-        prices: List of (timestamp, price) tuples
+        prices: Iterable of (timestamp, price) tuples (list or generator for streaming)
         threshold_pct: % move that closes the losing hedge side
         trailing_pct: % drop from max profit that closes all positions
         pyramid_step_pct: % interval to add new positions (from pyramid reference)

@@ -265,6 +265,148 @@ def fetch_tick_data(
     return all_prices
 
 
+def get_streaming_cache_path(symbol: str, years: int, aggregate_seconds: float) -> str:
+    """Get path to streaming cache file (CSV format for line-by-line reading)."""
+    return os.path.join(CACHE_DIR, f"{symbol}_{years}yr_agg{int(aggregate_seconds)}s_stream.csv")
+
+
+def ensure_cached_tick_data(
+    symbol: str,
+    years: int = 3,
+    aggregate_seconds: float = 1.0,
+    verbose: bool = True
+) -> str:
+    """
+    Ensure tick data is downloaded and cached to disk in streaming format.
+
+    Downloads month-by-month and writes to a CSV file that can be streamed
+    line-by-line without loading all data into memory.
+
+    Args:
+        symbol: Trading pair (e.g., "BTCUSDT")
+        years: Number of years of history
+        aggregate_seconds: Aggregate trades within this window (default 1s)
+        verbose: Print progress
+
+    Returns:
+        Path to the cache file.
+    """
+    ensure_cache_dir()
+    cache_path = get_streaming_cache_path(symbol, years, aggregate_seconds)
+
+    # Check if cache already exists
+    if os.path.exists(cache_path):
+        if verbose:
+            # Count lines to report size
+            with open(cache_path, 'r') as f:
+                line_count = sum(1 for _ in f)
+            print(f"  ✓ Using cached data: {line_count:,} prices from {cache_path}")
+        return cache_path
+
+    if verbose:
+        print(f"\n{'='*60}")
+        print(f"DOWNLOADING & CACHING: {symbol}")
+        print(f"{'='*60}")
+        print(f"Period: {years} year(s), {aggregate_seconds}s aggregation")
+
+    months = get_months_in_range(years)
+    total_prices = 0
+    total_trades = 0
+
+    # Write directly to disk as we download each month
+    with open(cache_path, 'w') as f:
+        for i, (year, month) in enumerate(months, 1):
+            if verbose:
+                print(f"  [{i}/{len(months)}] {year}-{month:02d}...", end=" ", flush=True)
+
+            result = download_and_aggregate_month(symbol, year, month, aggregate_seconds)
+
+            if result is None:
+                if verbose:
+                    print("not available")
+                continue
+
+            aggregated, trade_count = result
+            total_trades += trade_count
+
+            # Write each price point to disk immediately
+            for ts, price in aggregated:
+                f.write(f"{ts.isoformat()},{price}\n")
+                total_prices += 1
+
+            # Flush to ensure data is written
+            f.flush()
+
+            if verbose:
+                print(f"✓ {trade_count:,} trades → {len(aggregated):,} prices")
+
+            # Free memory from this month's data
+            del aggregated
+
+    if verbose:
+        print(f"\n{'='*60}")
+        print(f"Total: {total_prices:,} prices from {total_trades:,} trades")
+        print(f"Cached to: {cache_path}")
+        cache_size_mb = os.path.getsize(cache_path) / (1024 * 1024)
+        print(f"Cache size: {cache_size_mb:.1f} MB")
+        print(f"{'='*60}")
+
+    return cache_path
+
+
+def create_price_streamer(
+    symbol: str,
+    years: int = 3,
+    aggregate_seconds: float = 1.0,
+    verbose: bool = True
+) -> callable:
+    """
+    Create a function that streams prices from cache.
+
+    This ensures data is cached first, then returns a function that can be
+    called multiple times to stream through the prices. Each call creates
+    a fresh generator, allowing multiple backtests to iterate through the data.
+
+    Usage:
+        streamer = create_price_streamer("BTCUSDT", years=3)
+
+        # For each backtest:
+        for timestamp, price in streamer():
+            # process price
+
+    Args:
+        symbol: Trading pair
+        years: Number of years of history
+        aggregate_seconds: Aggregation window
+        verbose: Print progress during initial cache creation
+
+    Returns:
+        A callable that returns a generator of (datetime, price) tuples.
+    """
+    # Ensure data is cached (downloads if needed)
+    cache_path = ensure_cached_tick_data(symbol, years, aggregate_seconds, verbose)
+
+    def stream_prices() -> Generator[Tuple[datetime, float], None, None]:
+        """Generator that streams prices from the cache file."""
+        with open(cache_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    ts_str, price_str = line.split(',')
+                    yield (datetime.fromisoformat(ts_str), float(price_str))
+
+    return stream_prices
+
+
+def count_cached_prices(symbol: str, years: int, aggregate_seconds: float = 1.0) -> int:
+    """Count the number of prices in a cached file without loading all into memory."""
+    cache_path = get_streaming_cache_path(symbol, years, aggregate_seconds)
+    if not os.path.exists(cache_path):
+        return 0
+    with open(cache_path, 'r') as f:
+        return sum(1 for _ in f)
+
+
 def aggregate_trades(trades: List[Trade], window_seconds: float) -> List[Tuple[datetime, float]]:
     """
     Aggregate trades using VWAP within time windows.
