@@ -123,7 +123,9 @@ def run_pyramid_backtest(
     time_decay_exit_seconds: Optional[float] = None,
     volatility_filter_type: str = 'none',
     volatility_min_pct: float = 0.0,
-    volatility_window_size: int = 100
+    volatility_window_size: int = 100,
+    # MEMORY OPTIMIZATION:
+    return_rounds: bool = True  # Set False to skip accumulating round objects (saves memory)
 ) -> Dict:
     """
     Run pyramid strategy backtest.
@@ -145,11 +147,13 @@ def run_pyramid_backtest(
         volatility_filter_type: Volatility filter ('none', 'stddev', 'range')
         volatility_min_pct: Minimum volatility to add pyramids (0 = disabled)
         volatility_window_size: Number of prices for volatility calculation
+        return_rounds: If False, skip accumulating round objects (saves memory in grid search)
 
     Returns:
         Dictionary with backtest results
     """
-    rounds: List[PyramidRound] = []
+    # Only accumulate rounds if requested (saves memory in grid search)
+    rounds: List[PyramidRound] = [] if return_rounds else None
 
     # State tracking
     long_pos: PyramidPosition = None
@@ -171,6 +175,7 @@ def run_pyramid_backtest(
     total_fees = 0.0
     total_rounds = 0
     winning_rounds = 0
+    total_pyramids = 0  # Track for avg_pyramids when return_rounds=False
     
     for timestamp, price in prices:
         # Track recent prices for volatility calculation
@@ -339,6 +344,7 @@ def run_pyramid_backtest(
                 
                 total_pnl += round_pnl
                 total_rounds += 1
+                total_pyramids += len(pyramid_positions)  # Track for avg calculation
                 if round_pnl > 0:
                     winning_rounds += 1
                 
@@ -347,19 +353,20 @@ def run_pyramid_backtest(
                     print(f"[{timestamp}] {exit_reason} @ ${price:.2f} | Pyramids: {len(pyramid_positions)} | "
                           f"Max: {max_profit_pct:+.2f}% | Profit: {profit_from_entry:+.2f}% | Round P&L: {round_pnl:+.2f}%")
 
-                # Record round
-                rounds.append(PyramidRound(
-                    entry_price=round_entry_price,
-                    entry_time=round_entry_time,
-                    direction=direction,
-                    pyramid_reference=pyramid_reference,
-                    positions=pyramid_positions.copy(),
-                    max_profit_pct=max_profit_pct,
-                    exit_price=price,
-                    exit_time=timestamp,
-                    total_pnl=round_pnl,
-                    num_pyramids=len(pyramid_positions)
-                ))
+                # Record round (only if return_rounds=True to save memory)
+                if return_rounds:
+                    rounds.append(PyramidRound(
+                        entry_price=round_entry_price,
+                        entry_time=round_entry_time,
+                        direction=direction,
+                        pyramid_reference=pyramid_reference,
+                        positions=pyramid_positions.copy(),
+                        max_profit_pct=max_profit_pct,
+                        exit_price=price,
+                        exit_time=timestamp,
+                        total_pnl=round_pnl,
+                        num_pyramids=len(pyramid_positions)
+                    ))
 
                 # Reset for next round
                 pyramid_positions = []
@@ -371,7 +378,7 @@ def run_pyramid_backtest(
     
     # Calculate statistics
     if total_rounds == 0:
-        return {
+        result = {
             'threshold': threshold_pct,
             'trailing': trailing_pct,
             'pyramid_step': pyramid_step_pct,
@@ -382,10 +389,14 @@ def run_pyramid_backtest(
             'avg_pyramids': 0,
             'total_fees': total_fees
         }
+        if return_rounds:
+            result['rounds'] = []
+        return result
     
-    avg_pyramids = sum(r.num_pyramids for r in rounds) / len(rounds) if rounds else 0
-    
-    return {
+    # Calculate avg_pyramids from tracked total (works regardless of return_rounds)
+    avg_pyramids = total_pyramids / total_rounds if total_rounds > 0 else 0
+
+    result = {
         'threshold': threshold_pct,
         'trailing': trailing_pct,
         'pyramid_step': pyramid_step_pct,
@@ -395,8 +406,13 @@ def run_pyramid_backtest(
         'win_rate': (winning_rounds / total_rounds) * 100,
         'avg_pyramids': avg_pyramids,
         'total_fees': total_fees,
-        'rounds': rounds
     }
+
+    # Only include rounds list if requested (saves memory in grid search)
+    if return_rounds:
+        result['rounds'] = rounds
+
+    return result
 
 
 # Test function

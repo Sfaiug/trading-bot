@@ -23,6 +23,7 @@ import json
 import time
 import gc
 import struct
+import resource  # For memory monitoring
 from datetime import datetime
 from typing import List, Tuple, Dict, Optional, Callable, Generator, Any
 from dataclasses import dataclass, field
@@ -38,6 +39,40 @@ from data.tick_data_fetcher import (
     aggregate_ticks_to_interval
 )
 from backtest_pyramid import run_pyramid_backtest, PyramidRound
+
+
+# =============================================================================
+# MEMORY MONITORING
+# =============================================================================
+
+# Memory limit per instance (for 6 concurrent on 8GB system)
+MEMORY_WARNING_MB = 800  # Warn at 800MB
+MEMORY_CRITICAL_MB = 1200  # Force GC at 1.2GB
+
+
+def get_memory_usage_mb() -> float:
+    """Get current process memory usage in MB."""
+    # ru_maxrss is in bytes on macOS, KB on Linux
+    usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    if sys.platform == 'darwin':
+        return usage / (1024 * 1024)  # macOS: bytes to MB
+    else:
+        return usage / 1024  # Linux: KB to MB
+
+
+def check_memory_usage(context: str = "") -> None:
+    """Check memory usage and warn/force GC if high."""
+    usage_mb = get_memory_usage_mb()
+
+    if usage_mb > MEMORY_CRITICAL_MB:
+        print(f"\n  CRITICAL: Memory usage {usage_mb:.0f}MB > {MEMORY_CRITICAL_MB}MB [{context}]")
+        print("  Forcing garbage collection...")
+        gc.collect()
+        new_usage = get_memory_usage_mb()
+        print(f"  After GC: {new_usage:.0f}MB")
+    elif usage_mb > MEMORY_WARNING_MB:
+        print(f"\n  WARNING: Memory usage {usage_mb:.0f}MB > {MEMORY_WARNING_MB}MB [{context}]")
+        gc.collect()
 
 
 # =============================================================================
@@ -242,6 +277,32 @@ def create_fold_caches(
     """
     os.makedirs(CACHE_DIR, exist_ok=True)
 
+    # Check if caches already exist (skip re-creation to save time and memory)
+    existing_caches = []
+    for fold_num in range(num_folds):
+        train_cache = os.path.join(CACHE_DIR, f"{coin}_fold{fold_num}_train.bin")
+        val_cache = os.path.join(CACHE_DIR, f"{coin}_fold{fold_num}_val.bin")
+
+        if os.path.exists(train_cache) and os.path.exists(val_cache):
+            train_size = os.path.getsize(train_cache) // 16
+            val_size = os.path.getsize(val_cache) // 16
+            if train_size > 0 and val_size > 0:
+                existing_caches.append({
+                    'fold_num': fold_num,
+                    'train_cache': train_cache,
+                    'val_cache': val_cache,
+                    'train_size': train_size,
+                    'val_size': val_size,
+                })
+
+    if len(existing_caches) == num_folds:
+        total_train = sum(c['train_size'] for c in existing_caches)
+        total_val = sum(c['val_size'] for c in existing_caches)
+        print(f"  Using existing fold caches ({total_train:,} train, {total_val:,} val ticks)")
+        return existing_caches
+
+    print("  Creating new fold caches...")
+
     # First, count total ticks (streaming through)
     print("  Counting total ticks...")
     total_ticks = 0
@@ -439,7 +500,7 @@ def run_streaming_grid_search(
                 if max_pyr == 'unlimited':
                     max_pyr = 9999
 
-                # Run backtest with streaming data
+                # Run backtest with streaming data (return_rounds=False saves memory in grid search)
                 result = run_pyramid_backtest(
                     aggregated,
                     threshold_pct=full_params['threshold'],
@@ -453,7 +514,8 @@ def run_streaming_grid_search(
                     time_decay_exit_seconds=time_decay,
                     volatility_filter_type=full_params.get('vol_type', 'none'),
                     volatility_min_pct=full_params.get('vol_min', 0.0),
-                    volatility_window_size=full_params.get('vol_window', 100)
+                    volatility_window_size=full_params.get('vol_window', 100),
+                    return_rounds=False  # MEMORY OPTIMIZATION: Skip round accumulation
                 )
 
                 # Format for storage
@@ -496,9 +558,12 @@ def run_streaming_grid_search(
                 if completed % 5000 == 0:
                     print(f"\n    Error at combo {completed}: {e}")
 
-            # Periodic garbage collection
-            if completed % 10000 == 0:
+            # Periodic garbage collection (every 1000 for memory safety with 6 concurrent instances)
+            if completed % 1000 == 0:
                 gc.collect()
+            # Check memory usage periodically
+            if completed % 5000 == 0:
+                check_memory_usage(f"grid_search:{phase_name}:{completed}")
 
     print()  # Newline after progress
     return top_results
@@ -546,7 +611,8 @@ def run_single_backtest_streaming(cache_file: str, params: Dict) -> Dict:
         time_decay_exit_seconds=time_decay,
         volatility_filter_type=params.get('vol_type', 'none'),
         volatility_min_pct=params.get('vol_min', 0.0),
-        volatility_window_size=params.get('vol_window', 100)
+        volatility_window_size=params.get('vol_window', 100),
+        return_rounds=False  # MEMORY OPTIMIZATION: Skip round accumulation
     )
 
     return result
@@ -1033,12 +1099,20 @@ def main():
     print(f"{'=' * 70}")
 
     try:
-        tick_streamer = create_filtered_tick_streamer(coin, years=years, verbose=True)
+        tick_streamer = create_filtered_tick_streamer(
+            coin,
+            years=years,
+            verbose=True,
+            preload_to_memory=False  # CRITICAL: Stream from disk to avoid 500MB-1GB memory per instance
+        )
         cache_files = create_fold_caches(coin, tick_streamer, NUM_FOLDS)
 
         total_train = sum(c['train_size'] for c in cache_files)
         total_val = sum(c['val_size'] for c in cache_files)
         print(f"\n  Total across folds: {total_train:,} train ticks, {total_val:,} val ticks")
+
+        # Memory check after fold cache creation
+        check_memory_usage("after_fold_cache_creation")
 
     except Exception as e:
         print(f"ERROR: Failed to create fold caches: {e}")
