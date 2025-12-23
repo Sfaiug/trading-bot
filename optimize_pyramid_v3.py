@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Autonomous Single-Coin Pyramid Strategy Optimizer v3
+Autonomous Single-Coin Pyramid Strategy Optimizer v3 - REVISED
 
 Features:
 - Interactive coin selection at startup
-- Iterative convergence: narrows parameters each round until improvement < 0.1%
-- Boundary extension: extends search if best is at parameter edge
-- Crash recovery: saves checkpoint after each round
-- Final output: absolute best parameters for live trading
+- Walk-forward validation (train on 80%, validate on 20%)
+- Multi-basin search: explores top 3 DIVERSE parameter regions
+- Iterative convergence with proper boundary extension
+- Crash recovery with checkpoints
+- Overfitting detection and warnings
 
 Usage:
     python optimize_pyramid_v3.py
@@ -23,8 +24,8 @@ import json
 import time
 import gc
 from datetime import datetime
-from typing import List, Tuple, Dict, Optional, Callable
-from dataclasses import dataclass
+from typing import List, Tuple, Dict, Optional, Callable, Any
+from dataclasses import dataclass, field
 from copy import deepcopy
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -52,7 +53,12 @@ DEFAULT_COINS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "XLMUSD
 # Convergence settings
 MAX_ROUNDS = 10
 CONVERGENCE_THRESHOLD = 0.1  # Stop when improvement < 0.1%
-TOP_N = 10
+NUM_BASINS = 3  # Number of diverse parameter regions to explore
+MIN_DIVERSITY_DISTANCE = 0.15  # Minimum normalized distance between basins
+TOP_N = 100  # Keep top N results for diversity selection
+
+# Walk-forward settings
+TRAIN_RATIO = 0.8  # 80% train, 20% validation
 
 LOG_DIR = "logs"
 
@@ -72,35 +78,40 @@ PARAM_LIMITS = {
 
 
 # =============================================================================
-# ROUND 1: COARSE GRID (Aggressive - ~17M combinations)
+# ROUND 1: COARSE GRID (All Options - ~28M combinations)
 # =============================================================================
 
 def build_coarse_grid() -> Dict[str, List]:
     """
-    Generate Round 1 aggressive coarse parameter grid.
+    Generate Round 1 aggressive coarse parameter grid with ALL options.
 
-    Target: ~15-20 million combinations
-    - Core 5 params: ~10K combinations
-    - New 7 params: ~1.5K combinations
-    - Total: ~15M combinations = 12-24 hours
+    Includes exp_decay and range that were previously missing.
     """
     return {
-        # Core 5 parameters (8×8×6×5×5 = 9,600)
+        # Core 5 parameters (8x8x6x5x5 = 9,600)
         'threshold': [1, 3, 5, 7, 10, 13, 16, 20],
         'trailing': [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0],
         'pyramid_step': [0.5, 1.0, 1.5, 2.0, 2.5, 3.0],
         'max_pyramids': [5, 20, 80, 320, 9999],
         'poll_interval': [0, 0.2, 0.8, 3.2, 6.4],
-        # New 7 parameters (2×4×3×3×2×3×3 = 1,296)
-        'size_schedule': ['fixed', 'linear_decay'],  # exp_decay added in refinement if linear_decay wins
+        # New 7 parameters - ALL OPTIONS (3x4x3x3x3x3x3 = 2,916)
+        'size_schedule': ['fixed', 'linear_decay', 'exp_decay'],  # All 3 options
         'acceleration': [0.8, 1.0, 1.2, 1.5],
         'min_spacing': [0.0, 1.0, 2.5],
         'time_decay': [None, 300, 900],
-        'vol_type': ['none', 'stddev'],  # range added in refinement if stddev wins
+        'vol_type': ['none', 'stddev', 'range'],  # All 3 options
         'vol_min': [0.0, 0.5, 1.0],
         'vol_window': [50, 100, 200],
     }
-    # Total: 9,600 × 1,296 = 12,441,600 combinations (~12.4M)
+    # Total: 9,600 x 2,916 = 27,993,600 combinations (~28M)
+
+
+def calculate_grid_size(param_grid: Dict[str, List]) -> int:
+    """Calculate total combinations in a parameter grid."""
+    total = 1
+    for values in param_grid.values():
+        total *= len(values)
+    return total
 
 
 # =============================================================================
@@ -141,7 +152,141 @@ def select_coin_interactive() -> str:
 
 
 # =============================================================================
-# GRID NARROWING
+# WALK-FORWARD DATA SPLIT
+# =============================================================================
+
+def split_data_walk_forward(
+    tick_streamer: Callable,
+    train_ratio: float = TRAIN_RATIO
+) -> Tuple[List[Tuple[datetime, float]], List[Tuple[datetime, float]]]:
+    """
+    Split tick data into train and validation sets for walk-forward validation.
+
+    Args:
+        tick_streamer: Function that returns an iterator of (timestamp, price) tuples
+        train_ratio: Fraction of data for training (default 0.8 = 80%)
+
+    Returns:
+        (train_ticks, val_ticks) - Lists of (timestamp, price) tuples
+    """
+    print("  Loading all tick data for train/validation split...")
+    all_ticks = list(tick_streamer())
+    total = len(all_ticks)
+
+    if total == 0:
+        raise ValueError("No tick data available")
+
+    split_idx = int(total * train_ratio)
+    train_ticks = all_ticks[:split_idx]
+    val_ticks = all_ticks[split_idx:]
+
+    # Get date ranges
+    train_start = train_ticks[0][0] if train_ticks else None
+    train_end = train_ticks[-1][0] if train_ticks else None
+    val_start = val_ticks[0][0] if val_ticks else None
+    val_end = val_ticks[-1][0] if val_ticks else None
+
+    print(f"  Train: {len(train_ticks):,} ticks ({train_start} to {train_end})")
+    print(f"  Validation: {len(val_ticks):,} ticks ({val_start} to {val_end})")
+
+    return train_ticks, val_ticks
+
+
+def create_tick_iterator(ticks: List[Tuple[datetime, float]]) -> Callable:
+    """Create a tick streamer function from a list of ticks."""
+    def streamer():
+        for tick in ticks:
+            yield tick
+    return streamer
+
+
+# =============================================================================
+# DIVERSITY METRIC FOR MULTI-BASIN SELECTION
+# =============================================================================
+
+def param_distance(config1: Dict, config2: Dict) -> float:
+    """
+    Calculate normalized distance between two configurations.
+
+    Uses key numeric parameters to measure how different two configs are.
+    Returns value between 0 (identical) and 1 (maximally different).
+    """
+    distance = 0
+    params_to_compare = ['threshold', 'trailing', 'pyramid_step', 'max_pyramids']
+
+    for param in params_to_compare:
+        val1 = config1.get(param, 0)
+        val2 = config2.get(param, 0)
+
+        # Handle 'unlimited' max_pyramids
+        if val1 == 'unlimited':
+            val1 = 9999
+        if val2 == 'unlimited':
+            val2 = 9999
+
+        # Convert poll_interval labels
+        if param == 'poll_interval':
+            if isinstance(val1, str):
+                val1 = 0 if val1 == 'tick' else float(val1.replace('s', ''))
+            if isinstance(val2, str):
+                val2 = 0 if val2 == 'tick' else float(val2.replace('s', ''))
+
+        limits = PARAM_LIMITS.get(param, (0, 100))
+        range_span = limits[1] - limits[0]
+        if range_span > 0:
+            diff = abs(float(val1) - float(val2)) / range_span
+            distance += diff
+
+    return distance / len(params_to_compare)
+
+
+def select_diverse_top_n(
+    results: List[Dict],
+    n: int = NUM_BASINS,
+    min_distance: float = MIN_DIVERSITY_DISTANCE
+) -> List[Dict]:
+    """
+    Select top N configurations that are sufficiently different from each other.
+
+    This prevents all basins from being nearly identical parameter sets.
+
+    Args:
+        results: List of result dicts sorted by P&L descending
+        n: Number of diverse configurations to select
+        min_distance: Minimum normalized distance between selected configs
+
+    Returns:
+        List of n diverse configurations (or fewer if not enough diversity exists)
+    """
+    if not results:
+        return []
+
+    selected = [results[0]]  # Best always included
+
+    for config in results[1:]:
+        if len(selected) >= n:
+            break
+        # Check distance to all already selected configs
+        is_diverse = all(
+            param_distance(config, s) >= min_distance
+            for s in selected
+        )
+        if is_diverse:
+            selected.append(config)
+
+    # If we couldn't find enough diverse configs, fill with best remaining
+    if len(selected) < n:
+        for config in results[1:]:
+            if config not in selected:
+                selected.append(config)
+            if len(selected) >= n:
+                break
+
+    return selected
+
+
+# =============================================================================
+# GRID NARROWING WITH DELAYED CATEGORICAL LOCK-IN
 # =============================================================================
 
 def build_narrowed_grid(
@@ -152,33 +297,43 @@ def build_narrowed_grid(
     """
     Narrow parameter space around best from previous round.
 
-    Each round narrows by roughly 50% and uses finer step sizes.
+    Key fixes:
+    - Categorical parameters (size_schedule, vol_type) stay unlocked until Round 3
+    - Numeric parameters narrow progressively each round
     """
     narrowed = {}
 
     # Narrowing factor decreases each round
-    # Round 2: ±40% of range, Round 3: ±25%, Round 4+: ±15%
+    # Round 2: +/-40% of range, Round 3: +/-25%, Round 4+: +/-15%
     narrow_pct = max(0.15, 0.5 / round_num)
 
     for param, values in previous_ranges.items():
-        # Handle categorical parameters - keep all or just the best
+        # Handle categorical parameters with DELAYED lock-in
         if param in ['size_schedule', 'vol_type']:
-            # Keep best + maybe one alternative
-            best_val = best_params.get(param)
-            if best_val in values:
-                narrowed[param] = [best_val]
+            if round_num <= 2:
+                # Rounds 1-2: Keep ALL categorical options
+                narrowed[param] = values
+            elif round_num == 3:
+                # Round 3: Keep top 2 (best + one alternative)
+                best_val = best_params.get(param)
+                alternatives = [v for v in values if v != best_val]
+                narrowed[param] = [best_val] + alternatives[:1]
             else:
-                narrowed[param] = values[:1]
+                # Round 4+: Lock to best only
+                best_val = best_params.get(param)
+                narrowed[param] = [best_val] if best_val else values[:1]
             continue
 
         # Handle None-containing parameters (time_decay)
         if param == 'time_decay':
             best_val = best_params.get('time_decay')
-            if best_val is None:
+            if best_val is None or best_val == 'None':
                 # Best was no time decay - test nearby values or keep None
                 narrowed[param] = [None, 60, 120]
             else:
                 # Best was a specific value - narrow around it
+                if isinstance(best_val, str):
+                    best_val = int(best_val.replace('s', ''))
                 low = max(30, int(best_val * 0.6))
                 high = min(7200, int(best_val * 1.5))
                 step = max(30, (high - low) // 5)
@@ -194,6 +349,10 @@ def build_narrowed_grid(
         # Handle 'unlimited' max_pyramids
         if param == 'max_pyramids' and best_val == 'unlimited':
             best_val = 9999
+
+        # Handle poll_interval labels
+        if param == 'poll_interval' and isinstance(best_val, str):
+            best_val = 0 if best_val == 'tick' else float(best_val.replace('s', ''))
 
         # Calculate numeric range
         numeric_vals = sorted([v for v in values if isinstance(v, (int, float))])
@@ -226,7 +385,7 @@ def build_narrowed_grid(
 
 
 # =============================================================================
-# BOUNDARY DETECTION & EXTENSION
+# BOUNDARY DETECTION & EXTENSION (FIXED ORDER)
 # =============================================================================
 
 def check_boundaries(
@@ -246,10 +405,10 @@ def check_boundaries(
             continue
 
         # Skip time_decay None
-        if param == 'time_decay' and best_params.get(param) is None:
+        best_val = best_params.get(param)
+        if param == 'time_decay' and (best_val is None or best_val == 'None'):
             continue
 
-        best_val = best_params.get(param)
         if best_val is None:
             continue
 
@@ -257,15 +416,19 @@ def check_boundaries(
         if best_val == 'unlimited':
             best_val = 9999
 
+        # Handle poll_interval labels
+        if param == 'poll_interval' and isinstance(best_val, str):
+            best_val = 0 if best_val == 'tick' else float(best_val.replace('s', ''))
+
         # Get numeric values
         numeric_vals = sorted([v for v in values if v is not None and isinstance(v, (int, float))])
         if len(numeric_vals) < 2:
             continue
 
         # Check if at min or max
-        if best_val <= numeric_vals[0]:
+        if float(best_val) <= numeric_vals[0]:
             boundaries.append((param, 'min', best_val))
-        elif best_val >= numeric_vals[-1]:
+        elif float(best_val) >= numeric_vals[-1]:
             boundaries.append((param, 'max', best_val))
 
     return boundaries
@@ -277,6 +440,8 @@ def extend_range(
 ) -> Dict[str, List]:
     """
     Extend parameter ranges where best was at boundary.
+
+    This is now called AFTER narrowing, not before.
     """
     extended = deepcopy(param_ranges)
 
@@ -310,7 +475,7 @@ def extend_range(
             new_vals = [int(v) for v in new_vals]
 
         extended[param] = sorted(set(new_vals))
-        print(f"    Extended {param}: {values} → {extended[param]}")
+        print(f"    Extended {param}: {len(values)} -> {len(extended[param])} values")
 
     return extended
 
@@ -321,25 +486,22 @@ def extend_range(
 
 def run_grid_search(
     coin: str,
-    tick_streamer: Callable,
+    train_data: List[Tuple[datetime, float]],
     param_grid: Dict,
-    round_num: int
+    round_num: int,
+    basin_id: int = 0
 ) -> Tuple[str, List[Dict]]:
     """
-    Run grid search over all parameter combinations.
+    Run grid search over all parameter combinations using TRAIN data only.
 
     Returns (log_file_path, top_N_results)
     """
-    # Calculate total combinations
-    total = 1
-    for values in param_grid.values():
-        total *= len(values)
-
-    print(f"\n  Testing {total:,} combinations...")
+    total = calculate_grid_size(param_grid)
+    print(f"\n  Basin {basin_id}: Testing {total:,} combinations...")
 
     top_results = []
 
-    log_file = os.path.join(LOG_DIR, f"{coin}_round{round_num}_grid.csv")
+    log_file = os.path.join(LOG_DIR, f"{coin}_round{round_num}_basin{basin_id}_grid.csv")
 
     fieldnames = [
         'threshold', 'trailing', 'pyramid_step', 'max_pyramids', 'poll_interval',
@@ -358,6 +520,10 @@ def run_grid_search(
         # Nested loops over all parameters
         for poll_interval in param_grid['poll_interval']:
             poll_label = "tick" if poll_interval == 0 else f"{poll_interval}s"
+
+            # Pre-aggregate ticks for this poll interval
+            tick_iterator = create_tick_iterator(train_data)
+            aggregated_prices = list(aggregate_ticks_to_interval(tick_iterator, poll_interval))
 
             for size_sched in param_grid['size_schedule']:
                 for accel in param_grid['acceleration']:
@@ -383,15 +549,9 @@ def run_grid_search(
                                                                   end="", flush=True)
 
                                                         try:
-                                                            # Aggregate tick data
-                                                            price_stream = aggregate_ticks_to_interval(
-                                                                tick_streamer,
-                                                                poll_interval
-                                                            )
-
-                                                            # Run backtest
+                                                            # Run backtest on pre-aggregated data
                                                             result = run_pyramid_backtest(
-                                                                price_stream,
+                                                                iter(aggregated_prices),
                                                                 threshold_pct=threshold,
                                                                 trailing_pct=trailing,
                                                                 pyramid_step_pct=pyramid_step,
@@ -431,7 +591,7 @@ def run_grid_search(
                                                             writer.writerow(entry)
                                                             f.flush()
 
-                                                            # Track top N
+                                                            # Track top N for diversity selection
                                                             if len(top_results) < TOP_N:
                                                                 top_results.append(entry)
                                                                 top_results.sort(key=lambda x: x['total_pnl'], reverse=True)
@@ -448,25 +608,93 @@ def run_grid_search(
 
 
 # =============================================================================
+# SINGLE BACKTEST FOR VALIDATION
+# =============================================================================
+
+def run_single_backtest(
+    tick_data: List[Tuple[datetime, float]],
+    params: Dict
+) -> float:
+    """
+    Run a single backtest with specific parameters.
+
+    Returns total P&L percentage.
+    """
+    # Parse poll_interval
+    poll = params.get('poll_interval', 0)
+    if isinstance(poll, str):
+        poll = 0 if poll == 'tick' else float(poll.replace('s', ''))
+
+    # Parse time_decay
+    time_decay = params.get('time_decay')
+    if isinstance(time_decay, str):
+        time_decay = None if time_decay == 'None' else int(time_decay.replace('s', ''))
+
+    # Parse max_pyramids
+    max_pyr = params.get('max_pyramids', 20)
+    if max_pyr == 'unlimited':
+        max_pyr = 9999
+
+    # Aggregate tick data
+    tick_iterator = create_tick_iterator(tick_data)
+    price_stream = aggregate_ticks_to_interval(tick_iterator, poll)
+
+    result = run_pyramid_backtest(
+        price_stream,
+        threshold_pct=params['threshold'],
+        trailing_pct=params['trailing'],
+        pyramid_step_pct=params['pyramid_step'],
+        max_pyramids=max_pyr,
+        verbose=False,
+        pyramid_size_schedule=params.get('size_schedule', 'fixed'),
+        min_pyramid_spacing_pct=params.get('min_spacing', 0.0),
+        pyramid_acceleration=params.get('acceleration', 1.0),
+        time_decay_exit_seconds=time_decay,
+        volatility_filter_type=params.get('vol_type', 'none'),
+        volatility_min_pct=params.get('vol_min', 0.0),
+        volatility_window_size=params.get('vol_window', 100)
+    )
+
+    return result['total_pnl']
+
+
+# =============================================================================
 # CHECKPOINT SAVE/LOAD
 # =============================================================================
+
+@dataclass
+class Basin:
+    """Represents a parameter basin being explored."""
+    id: int
+    best_params: Dict
+    best_pnl: float
+    current_ranges: Dict
+    rounds_without_improvement: int = 0
+    converged: bool = False
+
 
 def save_checkpoint(
     coin: str,
     round_num: int,
-    best_params: Dict,
-    best_pnl: float,
-    round_history: List[Dict],
-    current_ranges: Dict
+    basins: List[Basin],
+    round_history: List[Dict]
 ) -> None:
     """Save checkpoint for crash recovery."""
     checkpoint = {
         'coin': coin,
         'current_round': round_num,
-        'best_pnl': best_pnl,
-        'best_params': best_params,
+        'basins': [
+            {
+                'id': b.id,
+                'best_params': b.best_params,
+                'best_pnl': b.best_pnl,
+                'current_ranges': b.current_ranges,
+                'rounds_without_improvement': b.rounds_without_improvement,
+                'converged': b.converged
+            }
+            for b in basins
+        ],
         'round_history': round_history,
-        'current_param_ranges': current_ranges,
         'timestamp': datetime.now().isoformat()
     }
 
@@ -474,7 +702,7 @@ def save_checkpoint(
     with open(checkpoint_file, 'w') as f:
         json.dump(checkpoint, f, indent=2, default=str)
 
-    print(f"  ✓ Checkpoint saved: {checkpoint_file}")
+    print(f"  Checkpoint saved: {checkpoint_file}")
 
 
 def load_checkpoint(coin: str) -> Optional[Dict]:
@@ -493,180 +721,284 @@ def load_checkpoint(coin: str) -> Optional[Dict]:
 
 
 # =============================================================================
-# ITERATIVE CONVERGENCE
+# MULTI-BASIN ITERATIVE OPTIMIZATION
 # =============================================================================
 
-def run_iterative_optimization(
+def run_multi_basin_optimization(
     coin: str,
-    tick_streamer: Callable,
+    train_data: List[Tuple[datetime, float]],
+    num_basins: int = NUM_BASINS,
     max_rounds: int = MAX_ROUNDS,
     convergence_threshold: float = CONVERGENCE_THRESHOLD,
     resume_from: Optional[Dict] = None
-) -> Tuple[Dict, List[Dict]]:
+) -> List[Basin]:
     """
-    Run iterative optimization until convergence.
+    Run iterative optimization across multiple diverse parameter basins.
 
-    Returns (best_params, round_history)
+    This prevents getting stuck in local optima by exploring different
+    regions of the parameter space in parallel.
+
+    Returns list of converged basins with their best parameters.
     """
     # Initialize or resume
     if resume_from:
-        round_history = resume_from['round_history']
-        best_params = resume_from['best_params']
-        best_pnl = resume_from['best_pnl']
-        current_ranges = resume_from['current_param_ranges']
+        round_history = resume_from.get('round_history', [])
+        basins = [
+            Basin(
+                id=b['id'],
+                best_params=b['best_params'],
+                best_pnl=b['best_pnl'],
+                current_ranges=b['current_ranges'],
+                rounds_without_improvement=b.get('rounds_without_improvement', 0),
+                converged=b.get('converged', False)
+            )
+            for b in resume_from['basins']
+        ]
         start_round = resume_from['current_round'] + 1
-        print(f"\n  Resuming from round {start_round} (best P&L: {best_pnl:+.2f}%)")
+        print(f"\n  Resuming from round {start_round} with {len(basins)} basins")
     else:
         round_history = []
-        best_params = None
-        best_pnl = float('-inf')
-        current_ranges = build_coarse_grid()
+        basins = []
         start_round = 1
 
+    # Round 1: Coarse grid to find diverse starting points
+    if start_round == 1:
+        print(f"\n{'=' * 70}")
+        print(f"ROUND 1 / {max_rounds} - COARSE GRID (Finding Diverse Basins)")
+        print(f"{'=' * 70}")
+
+        coarse_grid = build_coarse_grid()
+        grid_size = calculate_grid_size(coarse_grid)
+        print(f"  Grid size: {grid_size:,} combinations")
+
+        start_time = time.time()
+        log_file, top_results = run_grid_search(coin, train_data, coarse_grid, 1)
+        elapsed = time.time() - start_time
+
+        if not top_results:
+            print("  ERROR: No results from grid search!")
+            return []
+
+        # Select diverse basins
+        diverse_configs = select_diverse_top_n(top_results, num_basins, MIN_DIVERSITY_DISTANCE)
+        print(f"\n  Round 1 completed in {elapsed/3600:.2f} hours")
+        print(f"  Selected {len(diverse_configs)} diverse basins:")
+
+        for i, config in enumerate(diverse_configs):
+            basin = Basin(
+                id=i,
+                best_params=config,
+                best_pnl=config['total_pnl'],
+                current_ranges=coarse_grid
+            )
+            basins.append(basin)
+            print(f"    Basin {i}: T={config['threshold']}% Tr={config['trailing']}% -> {config['total_pnl']:+.2f}%")
+
+        round_history.append({
+            'round': 1,
+            'basins': [{'id': b.id, 'pnl': b.best_pnl} for b in basins],
+            'combos_tested': grid_size,
+            'elapsed_hours': elapsed / 3600
+        })
+
+        save_checkpoint(coin, 1, basins, round_history)
+        start_round = 2
+
+    # Rounds 2+: Refine each basin until convergence
     for round_num in range(start_round, max_rounds + 1):
         print(f"\n{'=' * 70}")
         print(f"ROUND {round_num} / {max_rounds}")
         print(f"{'=' * 70}")
 
-        # Calculate grid size
-        grid_size = 1
-        for values in current_ranges.values():
-            grid_size *= len(values)
-        print(f"  Grid size: {grid_size:,} combinations")
-
-        # Run grid search
-        start_time = time.time()
-        log_file, top_results = run_grid_search(coin, tick_streamer, current_ranges, round_num)
-        elapsed = time.time() - start_time
-
-        if not top_results:
-            print("  ERROR: No results from grid search!")
+        active_basins = [b for b in basins if not b.converged]
+        if not active_basins:
+            print("  All basins converged!")
             break
 
-        # Get best from this round
-        round_best = top_results[0]
-        round_pnl = round_best['total_pnl']
+        print(f"  Active basins: {len(active_basins)} / {len(basins)}")
 
-        print(f"\n  Round {round_num} completed in {elapsed/3600:.2f} hours")
-        print(f"  Best P&L this round: {round_pnl:+.2f}%")
-        print(f"  Top 3:")
-        for i, r in enumerate(top_results[:3], 1):
-            print(f"    #{i}: T={r['threshold']}% Tr={r['trailing']}% → {r['total_pnl']:+.2f}%")
+        round_start = time.time()
+        round_combos = 0
 
-        # Calculate improvement
-        if best_pnl > float('-inf'):
-            improvement = round_pnl - best_pnl
-            print(f"  Improvement: {improvement:+.2f}%")
-        else:
-            improvement = float('inf')
+        for basin in active_basins:
+            previous_pnl = basin.best_pnl
 
-        # Update best if improved
-        if round_pnl > best_pnl:
-            best_pnl = round_pnl
-            best_params = round_best
+            # 1. NARROW first (fixed order)
+            basin.current_ranges = build_narrowed_grid(
+                round_num, basin.best_params, basin.current_ranges
+            )
 
-        # Record round history
+            # 2. THEN check boundaries and extend if needed
+            boundaries = check_boundaries(basin.best_params, basin.current_ranges)
+            if boundaries:
+                print(f"  Basin {basin.id}: Best at boundary for {[b[0] for b in boundaries]}")
+                basin.current_ranges = extend_range(basin.current_ranges, boundaries)
+
+            # Run grid search
+            grid_size = calculate_grid_size(basin.current_ranges)
+            round_combos += grid_size
+
+            _, top_results = run_grid_search(
+                coin, train_data, basin.current_ranges, round_num, basin.id
+            )
+
+            if top_results:
+                basin.best_params = top_results[0]
+                basin.best_pnl = top_results[0]['total_pnl']
+
+                # Calculate improvement (FIXED: check for true convergence)
+                improvement = basin.best_pnl - previous_pnl
+
+                print(f"  Basin {basin.id}: {previous_pnl:+.2f}% -> {basin.best_pnl:+.2f}% "
+                      f"(improvement: {improvement:+.2f}%)")
+
+                # FIXED convergence check: only converge on small POSITIVE improvement
+                if 0 <= improvement < convergence_threshold:
+                    basin.converged = True
+                    basin.rounds_without_improvement = 0
+                    print(f"    -> CONVERGED (improvement < {convergence_threshold}%)")
+                elif improvement < 0:
+                    # Deterioration - don't converge, but track it
+                    basin.rounds_without_improvement += 1
+                    print(f"    -> Deterioration detected, continuing search")
+                    if basin.rounds_without_improvement >= 3:
+                        basin.converged = True
+                        print(f"    -> Giving up after 3 rounds without improvement")
+                else:
+                    basin.rounds_without_improvement = 0
+
+        round_elapsed = time.time() - round_start
         round_history.append({
             'round': round_num,
-            'best_pnl': round_pnl,
-            'improvement': improvement if improvement != float('inf') else None,
-            'combos_tested': grid_size,
-            'elapsed_hours': elapsed / 3600,
-            'params': round_best
+            'basins': [{'id': b.id, 'pnl': b.best_pnl, 'converged': b.converged} for b in basins],
+            'combos_tested': round_combos,
+            'elapsed_hours': round_elapsed / 3600
         })
 
-        # Save checkpoint
-        save_checkpoint(coin, round_num, best_params, best_pnl, round_history, current_ranges)
+        save_checkpoint(coin, round_num, basins, round_history)
 
-        # Check convergence
-        if round_num > 1 and improvement < convergence_threshold:
-            print(f"\n  ✓ CONVERGED: Improvement ({improvement:+.2f}%) < threshold ({convergence_threshold}%)")
+        # Check if all converged
+        if all(b.converged for b in basins):
+            print(f"\n  All basins converged!")
             break
 
-        # Check for boundaries
-        boundaries = check_boundaries(round_best, current_ranges)
-        if boundaries:
-            print(f"\n  ⚠ Best at boundary for: {[b[0] for b in boundaries]}")
-            current_ranges = extend_range(current_ranges, boundaries)
-
-        # Narrow for next round
-        if round_num < max_rounds:
-            current_ranges = build_narrowed_grid(round_num + 1, best_params, current_ranges)
-            next_size = 1
-            for values in current_ranges.values():
-                next_size *= len(values)
-            print(f"\n  Next round grid: {next_size:,} combinations")
-
-        # Force garbage collection
         gc.collect()
 
     print(f"\n{'=' * 70}")
-    print(f"OPTIMIZATION COMPLETE after {round_num} rounds")
-    print(f"Best P&L: {best_pnl:+.2f}%")
+    print(f"MULTI-BASIN OPTIMIZATION COMPLETE after {round_num} rounds")
     print(f"{'=' * 70}")
+    for b in basins:
+        status = "CONVERGED" if b.converged else "MAX ROUNDS"
+        print(f"  Basin {b.id}: {b.best_pnl:+.2f}% [{status}]")
 
-    return best_params, round_history
+    return basins
 
 
 # =============================================================================
-# FINAL OUTPUT
+# VALIDATION AND FINAL OUTPUT
 # =============================================================================
 
-def print_final_recommendation(coin: str, best_params: Dict, analytics: Dict = None):
-    """Print final recommendation in ready-to-use format."""
+def validate_basins(
+    basins: List[Basin],
+    val_data: List[Tuple[datetime, float]]
+) -> List[Dict]:
+    """
+    Validate each basin's best parameters on holdout data.
+
+    Returns list of validated results with train and validation P&L.
+    """
+    validated = []
+
+    for basin in basins:
+        val_pnl = run_single_backtest(val_data, basin.best_params)
+        overfit_ratio = basin.best_pnl / val_pnl if val_pnl > 0 else float('inf')
+
+        validated.append({
+            'basin_id': basin.id,
+            'params': basin.best_params,
+            'train_pnl': basin.best_pnl,
+            'val_pnl': val_pnl,
+            'overfit_ratio': overfit_ratio
+        })
+
+    return validated
+
+
+def print_final_recommendation(coin: str, validated_results: List[Dict]):
+    """Print final recommendation with train vs validation comparison."""
     print(f"\n{'=' * 70}")
     print(f"OPTIMIZATION COMPLETE: {coin}")
     print(f"{'=' * 70}")
 
-    print(f"\nABSOLUTE BEST PARAMETERS:")
-    print(f"  threshold_pct:      {best_params['threshold']}%")
-    print(f"  trailing_pct:       {best_params['trailing']}%")
-    print(f"  pyramid_step_pct:   {best_params['pyramid_step']}%")
-    print(f"  max_pyramids:       {best_params['max_pyramids']}")
-    print(f"  poll_interval:      {best_params['poll_interval']}")
-    print(f"  size_schedule:      {best_params['size_schedule']}")
-    print(f"  acceleration:       {best_params['acceleration']}")
-    print(f"  min_spacing:        {best_params['min_spacing']}%")
-    print(f"  time_decay:         {best_params['time_decay']}")
-    print(f"  vol_type:           {best_params['vol_type']}")
-    print(f"  vol_min:            {best_params['vol_min']}%")
-    print(f"  vol_window:         {best_params['vol_window']}")
+    # Sort by validation P&L (not train!)
+    sorted_results = sorted(validated_results, key=lambda x: x['val_pnl'], reverse=True)
+    winner = sorted_results[0]
+
+    print(f"\nVALIDATION RESULTS (sorted by validation P&L):")
+    for r in sorted_results:
+        ratio_warn = " <-- WINNER" if r == winner else ""
+        if r['overfit_ratio'] > 2.0:
+            ratio_warn += " [HIGH OVERFIT]"
+        print(f"  Basin {r['basin_id']}: Train={r['train_pnl']:+.1f}%, Val={r['val_pnl']:+.1f}%, "
+              f"Ratio={r['overfit_ratio']:.1f}x{ratio_warn}")
+
+    print(f"\nABSOLUTE BEST PARAMETERS (Validated on Year 5):")
+    params = winner['params']
+    print(f"  threshold_pct:      {params['threshold']}%")
+    print(f"  trailing_pct:       {params['trailing']}%")
+    print(f"  pyramid_step_pct:   {params['pyramid_step']}%")
+    print(f"  max_pyramids:       {params['max_pyramids']}")
+    print(f"  poll_interval:      {params['poll_interval']}")
+    print(f"  size_schedule:      {params['size_schedule']}")
+    print(f"  acceleration:       {params['acceleration']}")
+    print(f"  min_spacing:        {params['min_spacing']}%")
+    print(f"  time_decay:         {params['time_decay']}")
+    print(f"  vol_type:           {params['vol_type']}")
+    print(f"  vol_min:            {params['vol_min']}%")
+    print(f"  vol_window:         {params['vol_window']}")
 
     print(f"\nPERFORMANCE:")
-    print(f"  Total P&L:          {best_params['total_pnl']:+.2f}%")
-    print(f"  Win Rate:           {best_params['win_rate']:.1f}%")
-    print(f"  Avg P&L per Round:  {best_params['avg_pnl']:+.2f}%")
-    print(f"  Avg Pyramids:       {best_params['avg_pyramids']:.1f}")
+    print(f"  Train P&L (Years 1-4):   {winner['train_pnl']:+.2f}%")
+    print(f"  Validation P&L (Year 5): {winner['val_pnl']:+.2f}%")
+    print(f"  Overfit Ratio:           {winner['overfit_ratio']:.2f}x")
 
-    if analytics:
-        print(f"  Max Drawdown:       {analytics.get('max_drawdown', 'N/A')}%")
-        print(f"  Sharpe Ratio:       {analytics.get('sharpe_ratio', 'N/A')}")
+    if winner['overfit_ratio'] > 2.0:
+        print(f"\n  WARNING: Train P&L is {winner['overfit_ratio']:.1f}x validation P&L")
+        print(f"  This suggests overfitting. Consider using a more robust basin:")
+        for r in sorted_results[1:]:
+            if r['overfit_ratio'] < winner['overfit_ratio']:
+                print(f"    Basin {r['basin_id']}: ratio={r['overfit_ratio']:.1f}x, val={r['val_pnl']:+.1f}%")
 
     # Parse poll interval for command
-    poll = best_params['poll_interval']
+    poll = params['poll_interval']
     if poll == 'tick':
         poll_val = 0
     else:
         poll_val = float(poll.replace('s', ''))
 
-    max_pyr = best_params['max_pyramids']
+    max_pyr = params['max_pyramids']
     if max_pyr == 'unlimited':
         max_pyr = 9999
 
     print(f"\nLIVE TRADING COMMAND:")
     print(f"  python main.py --mode trading --symbol {coin} \\")
-    print(f"    --threshold {best_params['threshold']} --trailing {best_params['trailing']} \\")
-    print(f"    --pyramid {best_params['pyramid_step']} --max-pyramids {max_pyr}")
+    print(f"    --threshold {params['threshold']} --trailing {params['trailing']} \\")
+    print(f"    --pyramid {params['pyramid_step']} --max-pyramids {max_pyr}")
 
     print(f"{'=' * 70}")
 
+    return winner
 
-def save_final_result(coin: str, best_params: Dict, round_history: List[Dict]):
+
+def save_final_result(coin: str, validated_results: List[Dict], round_history: List[Dict]):
     """Save final result to JSON and CSV."""
+    winner = max(validated_results, key=lambda x: x['val_pnl'])
+
     # JSON with full details
     result = {
         'coin': coin,
-        'best_params': best_params,
+        'winner': winner,
+        'all_basins': validated_results,
         'round_history': round_history,
         'completed': datetime.now().isoformat()
     }
@@ -679,26 +1011,28 @@ def save_final_result(coin: str, best_params: Dict, round_history: List[Dict]):
     txt_file = os.path.join(LOG_DIR, f"{coin}_live_config.txt")
     with open(txt_file, 'w') as f:
         f.write(f"# {coin} Optimized Parameters\n")
-        f.write(f"# Generated: {datetime.now()}\n\n")
-        for key, value in best_params.items():
+        f.write(f"# Generated: {datetime.now()}\n")
+        f.write(f"# Train P&L: {winner['train_pnl']:+.2f}%\n")
+        f.write(f"# Validation P&L: {winner['val_pnl']:+.2f}%\n")
+        f.write(f"# Overfit Ratio: {winner['overfit_ratio']:.2f}x\n\n")
+        for key, value in winner['params'].items():
             f.write(f"{key}={value}\n")
 
     # Round history CSV
     csv_file = os.path.join(LOG_DIR, f"{coin}_round_history.csv")
     with open(csv_file, 'w', newline='') as f:
-        fieldnames = ['round', 'best_pnl', 'improvement', 'combos_tested', 'elapsed_hours']
+        fieldnames = ['round', 'basins_status', 'combos_tested', 'elapsed_hours']
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for rh in round_history:
             writer.writerow({
                 'round': rh['round'],
-                'best_pnl': rh['best_pnl'],
-                'improvement': rh.get('improvement'),
+                'basins_status': str(rh['basins']),
                 'combos_tested': rh['combos_tested'],
                 'elapsed_hours': round(rh['elapsed_hours'], 2)
             })
 
-    print(f"\n✓ Results saved:")
+    print(f"\nResults saved:")
     print(f"  - {json_file}")
     print(f"  - {txt_file}")
     print(f"  - {csv_file}")
@@ -711,7 +1045,7 @@ def save_final_result(coin: str, best_params: Dict, round_history: List[Dict]):
 def main():
     print("=" * 70)
     print("AUTONOMOUS PYRAMID STRATEGY OPTIMIZER v3")
-    print("(Single-Coin Iterative Convergence)")
+    print("(Multi-Basin Walk-Forward Validation)")
     print("=" * 70)
     print(f"Started: {datetime.now()}")
 
@@ -730,61 +1064,78 @@ def main():
     resume_from = None
 
     if checkpoint:
-        print(f"\n⚠ Found checkpoint from {checkpoint['timestamp']}")
+        print(f"\nFound checkpoint from {checkpoint['timestamp']}")
         print(f"  Round: {checkpoint['current_round']}")
-        print(f"  Best P&L: {checkpoint['best_pnl']:+.2f}%")
+        print(f"  Basins: {len(checkpoint['basins'])}")
         resume = input("Resume from checkpoint? [Y/n]: ").strip().lower()
         if resume != 'n':
             resume_from = checkpoint
         else:
             print("Starting fresh (checkpoint will be overwritten)")
 
-    # 5. Download/cache tick data
+    # 5. Download/cache tick data and split for walk-forward
     print(f"\n{'=' * 70}")
-    print("PHASE 1: LOADING TICK DATA")
+    print("PHASE 1: LOADING AND SPLITTING DATA")
     print(f"{'=' * 70}")
 
     try:
         tick_streamer = create_filtered_tick_streamer(coin, years=years, verbose=True)
-        total_ticks, filtered_ticks = count_filtered_ticks(coin, years, min_move_pct=0.01)
+        train_data, val_data = split_data_walk_forward(tick_streamer, TRAIN_RATIO)
 
-        if filtered_ticks < 1000:
-            print(f"ERROR: Insufficient data for {coin} ({filtered_ticks} ticks)")
+        if len(train_data) < 1000:
+            print(f"ERROR: Insufficient training data ({len(train_data)} ticks)")
             return
-
-        reduction = (1 - filtered_ticks / total_ticks) * 100 if total_ticks > 0 else 0
-        print(f"\n✓ Loaded: {filtered_ticks:,} filtered ticks ({reduction:.1f}% reduction)")
+        if len(val_data) < 100:
+            print(f"ERROR: Insufficient validation data ({len(val_data)} ticks)")
+            return
 
     except Exception as e:
         print(f"ERROR: Failed to load tick data: {e}")
         return
 
-    # 6. Run iterative optimization
+    # 6. Run multi-basin optimization on TRAIN data
     print(f"\n{'=' * 70}")
-    print("PHASE 2: ITERATIVE OPTIMIZATION")
+    print("PHASE 2: MULTI-BASIN OPTIMIZATION (Train Data)")
     print(f"{'=' * 70}")
     print(f"Max rounds: {MAX_ROUNDS}")
     print(f"Convergence threshold: {CONVERGENCE_THRESHOLD}%")
+    print(f"Number of basins: {NUM_BASINS}")
 
     total_start = time.time()
 
-    best_params, round_history = run_iterative_optimization(
+    basins = run_multi_basin_optimization(
         coin=coin,
-        tick_streamer=tick_streamer,
+        train_data=train_data,
+        num_basins=NUM_BASINS,
         max_rounds=MAX_ROUNDS,
         convergence_threshold=CONVERGENCE_THRESHOLD,
         resume_from=resume_from
     )
 
-    total_time = time.time() - total_start
+    if not basins:
+        print("ERROR: No basins produced by optimization")
+        return
 
-    # 7. Save and display final results
+    # 7. Validate on holdout data
     print(f"\n{'=' * 70}")
-    print("PHASE 3: FINAL RESULTS")
+    print("PHASE 3: VALIDATION (Year 5 Holdout Data)")
     print(f"{'=' * 70}")
 
-    save_final_result(coin, best_params, round_history)
-    print_final_recommendation(coin, best_params)
+    validated_results = validate_basins(basins, val_data)
+
+    total_time = time.time() - total_start
+
+    # 8. Save and display final results
+    print(f"\n{'=' * 70}")
+    print("PHASE 4: FINAL RESULTS")
+    print(f"{'=' * 70}")
+
+    # Load round history from checkpoint
+    checkpoint = load_checkpoint(coin)
+    round_history = checkpoint.get('round_history', []) if checkpoint else []
+
+    save_final_result(coin, validated_results, round_history)
+    winner = print_final_recommendation(coin, validated_results)
 
     print(f"\nTotal optimization time: {total_time/3600:.1f} hours")
     print(f"Completed: {datetime.now()}")
@@ -793,7 +1144,7 @@ def main():
     checkpoint_file = os.path.join(LOG_DIR, f"{coin}_checkpoint.json")
     if os.path.exists(checkpoint_file):
         os.rename(checkpoint_file, checkpoint_file.replace('.json', '_completed.json'))
-        print(f"\n✓ Checkpoint archived (optimization complete)")
+        print(f"\nCheckpoint archived (optimization complete)")
 
 
 if __name__ == "__main__":
