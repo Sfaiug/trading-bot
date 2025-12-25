@@ -14,10 +14,31 @@ import csv
 import json
 import zipfile
 import requests
+from enum import Enum
 from io import BytesIO
 from datetime import datetime, timedelta
 from typing import List, Tuple, Optional, Generator
 from dataclasses import dataclass
+
+
+# =============================================================================
+# PHASE 3 FIX: Data Granularity Modes
+# =============================================================================
+
+class DataGranularity(Enum):
+    """
+    Data granularity modes for tick data streaming.
+
+    The granularity mode significantly affects backtest accuracy:
+    - RAW_TICKS: Maximum accuracy, uses every single trade (SLOW, 50-80GB cache)
+    - TIME_SAMPLED: Good balance, samples at fixed time intervals (RECOMMENDED)
+    - MOVE_FILTERED: Fastest, only keeps ticks that moved min_move_pct (current default)
+
+    For optimizer: Use TIME_SAMPLED (100ms) for exploration, RAW_TICKS for final validation.
+    """
+    RAW_TICKS = "raw"        # Every tick (most accurate, slowest)
+    TIME_SAMPLED = "time"    # Every N milliseconds (good balance)
+    MOVE_FILTERED = "move"   # Only ticks that moved min_move_pct (fastest, least accurate)
 
 
 CACHE_DIR = os.environ.get("TICK_DATA_CACHE", "cache/trades")
@@ -144,10 +165,14 @@ def download_and_aggregate_month(
                             elapsed = (ts - window_start).total_seconds()
                             if elapsed >= aggregate_seconds:
                                 # Emit VWAP for completed window
+                                # PHASE 2.1 FIX: Use END of window time, not start
+                                # This prevents look-ahead bias - the price at time T
+                                # only includes information up to time T, not after
                                 if window_volume > 0:
                                     vwap = window_value / window_volume
-                                    aggregated_prices.append((window_start, vwap))
-                                
+                                    # Use current timestamp (end of window) for causal correctness
+                                    aggregated_prices.append((ts, vwap))
+
                                 # Start new window
                                 window_start = ts
                                 window_volume = qty
@@ -159,10 +184,12 @@ def download_and_aggregate_month(
                     except:
                         continue
         
-        # Emit final window
+        # Emit final window (use last trade timestamp for causal correctness)
         if window_volume > 0 and window_start is not None:
             vwap = window_value / window_volume
-            aggregated_prices.append((window_start, vwap))
+            # Use the last known timestamp, not window_start (Phase 2.1 fix)
+            final_ts = aggregated_prices[-1][0] if aggregated_prices else window_start
+            aggregated_prices.append((final_ts, vwap))
         
         del content  # Free ZIP content
         
@@ -935,13 +962,500 @@ def get_years_from_user() -> int:
             print("  Invalid input. Please enter a number.")
 
 
+# =============================================================================
+# PHASE 3 FIX: Configurable Tick Streamer with Granularity Modes
+# =============================================================================
+
+def create_configurable_tick_streamer(
+    symbol: str,
+    years: int = 3,
+    granularity: DataGranularity = DataGranularity.TIME_SAMPLED,
+    sample_interval_ms: float = 100.0,
+    min_move_pct: float = 0.01,
+    verbose: bool = True,
+    preload_to_memory: bool = False
+) -> callable:
+    """
+    Create a tick streamer with configurable data granularity.
+
+    This is the RECOMMENDED function for creating tick data streamers.
+    It provides multiple granularity modes to balance accuracy vs speed.
+
+    Args:
+        symbol: Trading pair (e.g., "BTCUSDT")
+        years: Number of years of history
+        granularity: DataGranularity mode:
+            - RAW_TICKS: Every tick (most accurate, 50-80GB cache)
+            - TIME_SAMPLED: Every sample_interval_ms (recommended, good balance)
+            - MOVE_FILTERED: Only ticks that moved min_move_pct (fastest)
+        sample_interval_ms: Time interval for TIME_SAMPLED mode (default 100ms)
+        min_move_pct: Minimum move % for MOVE_FILTERED mode (default 0.01%)
+        verbose: Print progress
+        preload_to_memory: Load all ticks into memory (faster but uses more RAM)
+
+    Returns:
+        Callable that returns a generator of (datetime, price) tuples.
+
+    Usage Examples:
+        # For optimizer exploration (fast, reasonable accuracy):
+        streamer = create_configurable_tick_streamer(
+            "BTCUSDT", years=5,
+            granularity=DataGranularity.TIME_SAMPLED,
+            sample_interval_ms=100  # 100ms = 10 samples/second
+        )
+
+        # For final validation (maximum accuracy):
+        streamer = create_configurable_tick_streamer(
+            "BTCUSDT", years=5,
+            granularity=DataGranularity.RAW_TICKS
+        )
+
+        # For quick prototyping (fastest):
+        streamer = create_configurable_tick_streamer(
+            "BTCUSDT", years=5,
+            granularity=DataGranularity.MOVE_FILTERED,
+            min_move_pct=0.05  # Only 5 basis point moves
+        )
+    """
+    if verbose:
+        mode_desc = {
+            DataGranularity.RAW_TICKS: "RAW_TICKS (every tick)",
+            DataGranularity.TIME_SAMPLED: f"TIME_SAMPLED ({sample_interval_ms}ms)",
+            DataGranularity.MOVE_FILTERED: f"MOVE_FILTERED ({min_move_pct}% min move)"
+        }
+        print(f"  Data granularity: {mode_desc[granularity]}")
+
+    if granularity == DataGranularity.RAW_TICKS:
+        # Maximum accuracy: every single tick
+        return create_tick_streamer_raw(symbol, years, verbose)
+
+    elif granularity == DataGranularity.TIME_SAMPLED:
+        # Time-based sampling: emit one price per interval
+        return _create_time_sampled_streamer(
+            symbol, years, sample_interval_ms, verbose, preload_to_memory
+        )
+
+    elif granularity == DataGranularity.MOVE_FILTERED:
+        # Move-based filtering: only emit when price moves enough
+        return create_filtered_tick_streamer(
+            symbol, years, min_move_pct, verbose, preload_to_memory
+        )
+
+    else:
+        raise ValueError(f"Unknown granularity: {granularity}")
+
+
+def _create_time_sampled_streamer(
+    symbol: str,
+    years: int,
+    sample_interval_ms: float,
+    verbose: bool,
+    preload_to_memory: bool
+) -> callable:
+    """
+    Create a time-sampled tick streamer.
+
+    Emits one price per sample_interval_ms, using the last price in each interval.
+    This preserves timing relationships better than move-filtered for strategy testing.
+    """
+    cache_path = ensure_cached_tick_data_raw(symbol, years, verbose)
+    interval_ms = int(sample_interval_ms)
+
+    if preload_to_memory:
+        if verbose:
+            print(f"  Loading time-sampled ticks into memory ({interval_ms}ms intervals)...")
+
+        sampled_ticks = []
+        current_window_ms = None
+        last_price_in_window = None
+        last_ts_in_window = None
+        total_ticks = 0
+
+        with open(cache_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+
+                total_ticks += 1
+                ts_ms_str, price_str = line.split(',')
+                ts_ms = int(ts_ms_str)
+                price = float(price_str)
+
+                # Calculate window
+                window_ms = (ts_ms // interval_ms) * interval_ms
+
+                if current_window_ms is None:
+                    current_window_ms = window_ms
+                    last_price_in_window = price
+                    last_ts_in_window = ts_ms
+                elif window_ms != current_window_ms:
+                    # Emit last price from previous window
+                    sampled_ticks.append((
+                        datetime.fromtimestamp(last_ts_in_window / 1000),
+                        last_price_in_window
+                    ))
+                    current_window_ms = window_ms
+                    last_price_in_window = price
+                    last_ts_in_window = ts_ms
+                else:
+                    # Update last price in current window
+                    last_price_in_window = price
+                    last_ts_in_window = ts_ms
+
+        # Emit final window
+        if last_price_in_window is not None:
+            sampled_ticks.append((
+                datetime.fromtimestamp(last_ts_in_window / 1000),
+                last_price_in_window
+            ))
+
+        if verbose and total_ticks > 0:
+            kept_ticks = len(sampled_ticks)
+            reduction = (1 - kept_ticks / total_ticks) * 100
+            mem_mb = (kept_ticks * 48) / (1024 * 1024)
+            print(f"  ✓ Loaded {kept_ticks:,} ticks into memory (~{mem_mb:.1f} MB)")
+            print(f"    Sampling: {total_ticks:,} raw → {kept_ticks:,} sampled ({reduction:.1f}% reduction)")
+
+        def stream_from_memory() -> Generator[Tuple[datetime, float], None, None]:
+            for tick in sampled_ticks:
+                yield tick
+
+        return stream_from_memory
+
+    else:
+        # Disk streaming mode
+        def stream_time_sampled() -> Generator[Tuple[datetime, float], None, None]:
+            current_window_ms = None
+            last_price_in_window = None
+            last_ts_in_window = None
+
+            with open(cache_path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+
+                    ts_ms_str, price_str = line.split(',')
+                    ts_ms = int(ts_ms_str)
+                    price = float(price_str)
+
+                    window_ms = (ts_ms // interval_ms) * interval_ms
+
+                    if current_window_ms is None:
+                        current_window_ms = window_ms
+                        last_price_in_window = price
+                        last_ts_in_window = ts_ms
+                    elif window_ms != current_window_ms:
+                        # Emit last price from previous window
+                        yield (
+                            datetime.fromtimestamp(last_ts_in_window / 1000),
+                            last_price_in_window
+                        )
+                        current_window_ms = window_ms
+                        last_price_in_window = price
+                        last_ts_in_window = ts_ms
+                    else:
+                        last_price_in_window = price
+                        last_ts_in_window = ts_ms
+
+            # Emit final window
+            if last_price_in_window is not None:
+                yield (
+                    datetime.fromtimestamp(last_ts_in_window / 1000),
+                    last_price_in_window
+                )
+
+        return stream_time_sampled
+
+
+def estimate_tick_counts(symbol: str, years: int) -> dict:
+    """
+    Estimate tick counts for different granularity modes.
+
+    Useful for planning which granularity to use.
+
+    Returns:
+        Dict with estimated counts for each mode.
+    """
+    cache_path = get_tick_cache_path(symbol, years)
+    if not os.path.exists(cache_path):
+        return {
+            'raw_ticks': 0,
+            'time_sampled_100ms': 0,
+            'move_filtered_001pct': 0,
+            'cache_exists': False
+        }
+
+    # Count raw ticks
+    total_raw = 0
+    with open(cache_path, 'r') as f:
+        for _ in f:
+            total_raw += 1
+
+    # Estimate based on typical ratios:
+    # - 100ms sampling typically reduces by 90-95%
+    # - 0.01% move filter typically reduces by 99%+
+
+    return {
+        'raw_ticks': total_raw,
+        'time_sampled_100ms': int(total_raw * 0.05),  # ~5% of raw
+        'time_sampled_1s': int(total_raw * 0.01),     # ~1% of raw
+        'move_filtered_001pct': int(total_raw * 0.01),  # ~1% of raw
+        'move_filtered_01pct': int(total_raw * 0.001),  # ~0.1% of raw
+        'cache_exists': True
+    }
+
+
+# =============================================================================
+# PHASE 3.2 FIX: Data Quality Validation
+# =============================================================================
+
+@dataclass
+class DataQualityReport:
+    """
+    Report of data quality issues found in tick data.
+
+    Data quality issues can severely impact backtest reliability:
+    - Gaps: Missing data means missed trading opportunities or false signals
+    - Flash crashes: Extreme moves may trigger false entries/exits
+    - Anomalies: Corrupt data leads to impossible P&L calculations
+    """
+    # Summary stats
+    total_ticks: int = 0
+    first_timestamp: Optional[datetime] = None
+    last_timestamp: Optional[datetime] = None
+    total_days: float = 0.0
+
+    # Gap analysis
+    gap_count: int = 0
+    max_gap_hours: float = 0.0
+    gaps_over_1h: List[Tuple[datetime, datetime, float]] = None  # (start, end, hours)
+    gaps_over_24h: List[Tuple[datetime, datetime, float]] = None
+    gaps_over_7d: int = 0
+
+    # Flash crash detection
+    flash_crash_count: int = 0
+    flash_crashes: List[Tuple[datetime, float, float]] = None  # (time, move_pct, duration_sec)
+
+    # Price anomalies
+    zero_price_count: int = 0
+    negative_price_count: int = 0
+    extreme_price_count: int = 0  # Prices > 10x or < 0.1x median
+
+    # Overall verdict
+    is_valid: bool = True
+    rejection_reason: Optional[str] = None
+    warnings: List[str] = None
+
+    def __post_init__(self):
+        if self.gaps_over_1h is None:
+            self.gaps_over_1h = []
+        if self.gaps_over_24h is None:
+            self.gaps_over_24h = []
+        if self.flash_crashes is None:
+            self.flash_crashes = []
+        if self.warnings is None:
+            self.warnings = []
+
+
+def validate_data_quality(
+    prices: List[Tuple[datetime, float]],
+    max_gap_days: float = 7.0,
+    flash_crash_threshold_pct: float = 10.0,
+    flash_crash_window_sec: float = 60.0,
+    verbose: bool = True
+) -> DataQualityReport:
+    """
+    Validate tick data quality before backtesting.
+
+    PHASE 3.2 FIX: Ensures data doesn't have issues that would corrupt backtest results.
+
+    Args:
+        prices: List of (timestamp, price) tuples
+        max_gap_days: Reject data with gaps larger than this (default 7 days)
+        flash_crash_threshold_pct: Flag moves larger than this in short window
+        flash_crash_window_sec: Window for flash crash detection
+        verbose: Print detailed report
+
+    Returns:
+        DataQualityReport with all findings
+    """
+    report = DataQualityReport()
+
+    if not prices:
+        report.is_valid = False
+        report.rejection_reason = "No price data provided"
+        return report
+
+    report.total_ticks = len(prices)
+    report.first_timestamp = prices[0][0]
+    report.last_timestamp = prices[-1][0]
+    report.total_days = (prices[-1][0] - prices[0][0]).total_seconds() / 86400
+
+    # Calculate median price for anomaly detection
+    all_prices = [p[1] for p in prices]
+    sorted_prices = sorted(all_prices)
+    median_price = sorted_prices[len(sorted_prices) // 2]
+
+    # Scan through data
+    prev_ts = prices[0][0]
+    prev_price = prices[0][1]
+
+    for i, (ts, price) in enumerate(prices[1:], start=1):
+        # Check for price anomalies
+        if price <= 0:
+            if price == 0:
+                report.zero_price_count += 1
+            else:
+                report.negative_price_count += 1
+            continue
+
+        if price > median_price * 10 or price < median_price * 0.1:
+            report.extreme_price_count += 1
+
+        # Check for gaps
+        gap_seconds = (ts - prev_ts).total_seconds()
+        gap_hours = gap_seconds / 3600
+
+        if gap_hours > 1:
+            report.gap_count += 1
+            report.gaps_over_1h.append((prev_ts, ts, gap_hours))
+
+            if gap_hours > report.max_gap_hours:
+                report.max_gap_hours = gap_hours
+
+            if gap_hours > 24:
+                report.gaps_over_24h.append((prev_ts, ts, gap_hours))
+
+                if gap_hours > 24 * 7:
+                    report.gaps_over_7d += 1
+
+        # Check for flash crashes (large move in short time)
+        if gap_seconds <= flash_crash_window_sec and gap_seconds > 0:
+            move_pct = abs((price - prev_price) / prev_price) * 100
+            if move_pct >= flash_crash_threshold_pct:
+                report.flash_crash_count += 1
+                report.flash_crashes.append((ts, move_pct, gap_seconds))
+
+        prev_ts = ts
+        prev_price = price
+
+    # Generate warnings
+    if report.gap_count > 0:
+        report.warnings.append(f"Found {report.gap_count} gaps > 1 hour")
+
+    if report.gaps_over_24h:
+        report.warnings.append(f"Found {len(report.gaps_over_24h)} gaps > 24 hours")
+
+    if report.flash_crash_count > 0:
+        report.warnings.append(
+            f"Found {report.flash_crash_count} flash crashes (>{flash_crash_threshold_pct}% in <{flash_crash_window_sec}s)"
+        )
+
+    if report.zero_price_count > 0:
+        report.warnings.append(f"Found {report.zero_price_count} zero prices")
+
+    if report.extreme_price_count > 0:
+        report.warnings.append(f"Found {report.extreme_price_count} extreme prices (>10x or <0.1x median)")
+
+    # Determine validity
+    if report.gaps_over_7d > 0:
+        report.is_valid = False
+        report.rejection_reason = f"Data has {report.gaps_over_7d} gaps longer than 7 days"
+    elif report.negative_price_count > 0:
+        report.is_valid = False
+        report.rejection_reason = f"Data has {report.negative_price_count} negative prices"
+    elif report.total_ticks < 1000:
+        report.is_valid = False
+        report.rejection_reason = f"Insufficient data: only {report.total_ticks} ticks"
+    elif report.max_gap_hours > max_gap_days * 24:
+        report.is_valid = False
+        report.rejection_reason = f"Max gap ({report.max_gap_hours:.1f}h) exceeds limit ({max_gap_days * 24}h)"
+
+    if verbose:
+        print("\n" + "=" * 60)
+        print("DATA QUALITY VALIDATION REPORT")
+        print("=" * 60)
+        print(f"Total ticks: {report.total_ticks:,}")
+        print(f"Date range: {report.first_timestamp} to {report.last_timestamp}")
+        print(f"Total days: {report.total_days:.1f}")
+        print(f"\nGap Analysis:")
+        print(f"  Gaps > 1 hour: {report.gap_count}")
+        print(f"  Gaps > 24 hours: {len(report.gaps_over_24h)}")
+        print(f"  Gaps > 7 days: {report.gaps_over_7d}")
+        print(f"  Max gap: {report.max_gap_hours:.1f} hours")
+        print(f"\nAnomaly Detection:")
+        print(f"  Flash crashes: {report.flash_crash_count}")
+        print(f"  Zero prices: {report.zero_price_count}")
+        print(f"  Extreme prices: {report.extreme_price_count}")
+
+        if report.warnings:
+            print(f"\nWarnings:")
+            for w in report.warnings:
+                print(f"  - {w}")
+
+        print(f"\nVerdict: {'VALID' if report.is_valid else 'REJECTED'}")
+        if report.rejection_reason:
+            print(f"Reason: {report.rejection_reason}")
+        print("=" * 60)
+
+    return report
+
+
+def filter_anomalous_ticks(
+    prices: List[Tuple[datetime, float]],
+    remove_zero: bool = True,
+    remove_extreme: bool = True,
+    extreme_threshold: float = 5.0
+) -> List[Tuple[datetime, float]]:
+    """
+    Filter out anomalous ticks from price data.
+
+    Args:
+        prices: List of (timestamp, price) tuples
+        remove_zero: Remove ticks with zero price
+        remove_extreme: Remove extreme price outliers
+        extreme_threshold: Multiple of median to consider extreme
+
+    Returns:
+        Cleaned price list
+    """
+    if not prices:
+        return []
+
+    all_prices = [p[1] for p in prices if p[1] > 0]
+    if not all_prices:
+        return []
+
+    sorted_prices = sorted(all_prices)
+    median_price = sorted_prices[len(sorted_prices) // 2]
+
+    filtered = []
+    for ts, price in prices:
+        # Skip zero prices
+        if remove_zero and price <= 0:
+            continue
+
+        # Skip extreme prices
+        if remove_extreme:
+            if price > median_price * extreme_threshold:
+                continue
+            if price < median_price / extreme_threshold:
+                continue
+
+        filtered.append((ts, price))
+
+    return filtered
+
+
 # Test
 if __name__ == "__main__":
     years = get_years_from_user()
     print(f"\nFetching {years} year(s) of BTCUSDT tick data...")
-    
+
     prices = fetch_tick_data("BTCUSDT", years=years, aggregate_seconds=1.0)
-    
+
     if prices:
         print(f"\nSuccess! Got {len(prices):,} price points")
         print(f"First: {prices[0]}")

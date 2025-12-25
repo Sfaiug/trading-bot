@@ -191,7 +191,9 @@ def calculate_sharpe_ratio(
     if std_dev == 0:
         return 0.0
     
-    # Estimate periods per year based on actual data
+    # Estimate periods per year based on ACTUAL trading duration
+    # This prevents Sharpe inflation: 100 rounds over 5 years = 20/year, not 100/year
+    # Example: 100 rounds, 1825 days -> periods_per_year = (100/1825)*365 = 20
     if rounds:
         total_days = (rounds[-1].exit_time - rounds[0].entry_time).days
         if total_days > 0:

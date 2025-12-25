@@ -21,7 +21,10 @@ Usage:
 """
 
 import argparse
+import csv
+import os
 import sys
+from datetime import datetime
 
 from core.exchange import BinanceExchange
 from strategies.pyramid_trading import PyramidTradingStrategy
@@ -410,6 +413,43 @@ def main():
     
     # Run strategy with dashboard
     if mode == "trading":
+        # =========================================================================
+        # PAPER TRADING VALIDATION (Phase 2 Enhancement)
+        # =========================================================================
+        # Log completed rounds to CSV for comparison against Monte Carlo expectations.
+        # This enables validation_pipeline.py to compare actual vs expected performance.
+        # =========================================================================
+        os.makedirs("logs/paper_trading", exist_ok=True)
+        paper_log_file = f"logs/paper_trading/{symbol}_{datetime.now():%Y%m%d_%H%M%S}.csv"
+
+        # Initialize CSV with header
+        with open(paper_log_file, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                'round_num', 'start_time', 'end_time', 'direction',
+                'num_pyramids', 'entry_price', 'exit_price',
+                'pnl_pct', 'max_profit_pct', 'is_win'
+            ])
+
+        def log_round_to_csv(round_data: dict):
+            """Append completed round to CSV log."""
+            with open(paper_log_file, 'a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    round_data['round_num'],
+                    round_data['start_time'].isoformat(),
+                    round_data['end_time'].isoformat(),
+                    round_data['direction'],
+                    round_data['num_pyramids'],
+                    round_data['entry_price'],
+                    round_data['exit_price'],
+                    round_data['pnl_pct'],
+                    round_data['max_profit_pct'],
+                    round_data['is_win'],
+                ])
+
+        print(f"[Paper Trading] Logging rounds to: {paper_log_file}")
+
         strategy = PyramidTradingStrategy(
             exchange=exchange,
             symbol=symbol,
@@ -418,7 +458,8 @@ def main():
             pyramid_step_pct=config['pyramid'],
             position_size=quantity,
             max_rounds=config['rounds'],
-            dashboard=dashboard
+            dashboard=dashboard,
+            on_round_complete=log_round_to_csv  # Paper trading validation callback
         )
     else:
         strategy = FundingRateStrategy(

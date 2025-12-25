@@ -24,8 +24,9 @@ DEFAULT_TRAILING_STOP_PERCENT = 1.0  # Default 1%
 TESTNET = True  # Always use testnet for this bot
 TESTNET_BASE_URL = "https://testnet.binancefuture.com"
 
-# Polling interval
-PRICE_CHECK_INTERVAL = 1  # seconds
+# Polling interval - configurable to match optimizer-found best poll_interval
+# After optimization, set env var to match winner: export PRICE_CHECK_INTERVAL=0.5
+PRICE_CHECK_INTERVAL = float(os.getenv("PRICE_CHECK_INTERVAL", "1"))  # seconds
 
 # Logging
 LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs")

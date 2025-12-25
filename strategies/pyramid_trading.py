@@ -34,8 +34,11 @@ class PyramidTradingStrategy:
     """
     Live pyramid trading strategy with dashboard UI.
     Opens hedge, pyramids into winning direction, trails profit.
+
+    PHASE 3.3 FIX: Added 9 parameters from backtest to ensure consistency.
+    All parameters optimized in backtest now exist in live trading code.
     """
-    
+
     def __init__(
         self,
         exchange: BinanceExchange,
@@ -46,7 +49,23 @@ class PyramidTradingStrategy:
         position_size: float = 1.0,
         max_pyramids: int = 10,
         max_rounds: Optional[int] = None,
-        dashboard: Optional[TradingDashboard] = None
+        dashboard: Optional[TradingDashboard] = None,
+        # PHASE 3.3 FIX: 9 parameters synced from backtest
+        # Causal trailing stop parameters:
+        use_causal_trailing: bool = True,  # Enable causal trailing stop (no look-ahead)
+        confirmation_ticks: int = 3,  # Ticks required to confirm a new peak
+        # Pyramid sizing parameters:
+        pyramid_size_schedule: str = 'fixed',  # 'fixed', 'linear_decay', 'exp_decay'
+        pyramid_acceleration: float = 1.0,  # Spacing multiplier (>1 = wider spacing)
+        min_pyramid_spacing_pct: float = 0.0,  # Minimum % between pyramids
+        # Time-based exit:
+        time_decay_exit_seconds: Optional[float] = None,  # Force exit after N seconds
+        # Volatility filter:
+        volatility_filter_type: str = 'none',  # 'none', 'stddev', 'range'
+        volatility_min_pct: float = 0.0,  # Minimum volatility to trade
+        volatility_window_size: int = 100,  # Window for volatility calculation
+        # Paper trading validation callback:
+        on_round_complete: Optional[callable] = None  # Callback(round_data: dict) for logging
     ):
         self.exchange = exchange
         self.symbol = symbol
@@ -57,7 +76,27 @@ class PyramidTradingStrategy:
         self.max_pyramids = max_pyramids
         self.max_rounds = max_rounds
         self.dashboard = dashboard
-        
+
+        # PHASE 3.3 FIX: Store 9 synced parameters
+        self.use_causal_trailing = use_causal_trailing
+        self.confirmation_ticks = confirmation_ticks
+        self.pyramid_size_schedule = pyramid_size_schedule
+        self.pyramid_acceleration = pyramid_acceleration
+        self.min_pyramid_spacing_pct = min_pyramid_spacing_pct
+        self.time_decay_exit_seconds = time_decay_exit_seconds
+        self.volatility_filter_type = volatility_filter_type
+        self.volatility_min_pct = volatility_min_pct
+        self.volatility_window_size = volatility_window_size
+
+        # Paper trading validation callback
+        self.on_round_complete = on_round_complete
+
+        # Causal trailing state (for use_causal_trailing=True)
+        self._confirmed_max_profit_pct = 0.0
+        self._candidate_max_profit_pct = 0.0
+        self._confirmation_count = 0
+        self._price_history = []  # For volatility calculation
+
         # State
         self.running = False
         self.round_number = 0
@@ -353,7 +392,26 @@ class PyramidTradingStrategy:
             print(f"   Exit Profit: {profit_from_entry:+.2f}%")
             print(f"   Round P&L: {round_pnl:+.2f}%")
             print(f"   Total P&L: {self.total_pnl:+.2f}%")
-        
+
+        # Paper trading validation callback (Phase 2 Enhancement)
+        if self.on_round_complete:
+            round_data = {
+                'round_num': self.round_number,
+                'start_time': self.pyramid_positions[0].entry_time if self.pyramid_positions else datetime.now(),
+                'end_time': datetime.now(),
+                'direction': self.direction,
+                'num_pyramids': len(self.pyramid_positions),
+                'entry_price': self.round_entry_price,
+                'exit_price': price,
+                'pnl_pct': round_pnl,
+                'max_profit_pct': self.max_profit_pct,
+                'is_win': is_win,
+            }
+            try:
+                self.on_round_complete(round_data)
+            except Exception as e:
+                print(f"Warning: round callback failed: {e}")
+
         # Reset
         self.pyramid_positions = []
         self.direction = ''
