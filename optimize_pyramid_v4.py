@@ -1667,9 +1667,9 @@ def main():
     if APPLY_FUNDING_RATES:
         try:
             print(f"  Fetching historical funding rates for {coin}...")
-            funding_data = get_funding_rates(coin, limit=1000)
-            if funding_data:
-                funding_rates = create_funding_rate_lookup(funding_data)
+            # get_funding_rates returns (payments_list, lookup_dict)
+            payments, funding_rates = get_funding_rates(coin, years=5)
+            if funding_rates:
                 print(f"  Loaded {len(funding_rates)} funding rate entries")
                 # Calculate average annual funding
                 avg_rate = sum(funding_rates.values()) / len(funding_rates) if funding_rates else 0
