@@ -273,68 +273,90 @@ def passes_risk_constraints(result: Dict) -> Tuple[bool, List[str]]:
 
 
 # =============================================================================
-# DATA LOADING
+# DATA LOADING (MEMORY-EFFICIENT DISK-BASED)
 # =============================================================================
 
-def load_tick_data(symbol: str, days: int, cache_dir: str = "./cache/trades") -> Tuple[List, Dict]:
-    """Load tick data for backtesting."""
-    from data.tick_data_fetcher import fetch_tick_data
+def load_tick_data_memmap(symbol: str, days: int) -> Tuple[any, Dict, Dict]:
+    """
+    Load tick data using memory-mapped files (LOW RAM USAGE).
 
-    # Convert days to years (fetch_tick_data uses years)
+    Downloads data to disk month-by-month (never all in RAM), then
+    memory-maps the file for efficient access. OS handles paging.
+
+    Args:
+        symbol: Trading pair (e.g., "BTCUSDT")
+        days: Number of days of history
+
+    Returns:
+        Tuple of (memmap_prices, metadata, funding_rates)
+    """
+    from core.memmap_prices import (
+        ensure_prices_on_disk,
+        load_prices_memmap,
+        validate_memmap_quality,
+        load_funding_rates,
+        print_memmap_info,
+    )
+
+    # Convert days to years
     years = max(1, days // 365)
 
-    print(f"Loading tick data for {symbol} ({years} years)...")
-    ticks = fetch_tick_data(symbol, years=years, aggregate_seconds=1.0, verbose=True)
+    print(f"Loading tick data for {symbol} ({years} years) - DISK-BASED MODE")
 
-    # Data quality validation (from v4)
-    if VALIDATE_DATA_QUALITY and len(ticks) > 0:
-        print("  Validating data quality...")
-        try:
-            from data.tick_data_fetcher import validate_data_quality
-            sample = ticks[:min(100000, len(ticks))]
-            quality_report = validate_data_quality(sample)
-            if quality_report:
-                print(f"  Data quality: {quality_report.quality_score:.1f}%")
-                if quality_report.quality_score < 80:
-                    print("  WARNING: Data quality below 80%")
-        except Exception as e:
-            print(f"  Data quality check failed: {e}")
+    # Download to disk if not cached (low RAM - processes month-by-month)
+    prices_file, meta = ensure_prices_on_disk(symbol, years)
 
-    # Load funding rates
+    # Memory-map the file (OS handles paging, very low RAM)
+    prices = load_prices_memmap(prices_file, meta)
+    print_memmap_info(prices, meta)
+
+    # Data quality validation (samples, doesn't load all)
+    if VALIDATE_DATA_QUALITY:
+        validate_memmap_quality(prices)
+
+    # Load funding rates (small, stays in RAM)
     funding_rates = {}
     if APPLY_FUNDING_RATES:
-        try:
-            from data.funding_rate_fetcher import get_funding_rates
-            payments, funding_rates = get_funding_rates(symbol, years=5)
-            if funding_rates:
-                print(f"  Loaded {len(funding_rates)} funding rate entries")
-        except Exception as e:
-            print(f"  Could not load funding rates: {e}")
+        funding_rates = load_funding_rates(symbol, years)
 
-    return ticks, funding_rates
+    return prices, meta, funding_rates
 
 
-def slice_data_by_fold(ticks: List, fold: Dict, total_days: int) -> Tuple[List, List]:
-    """Slice tick data into train and validation portions for a fold."""
-    total_ticks = len(ticks)
+def slice_prices_for_fold(prices, fold: Dict) -> Tuple[any, any]:
+    """
+    Slice memory-mapped prices for a fold's train and validation data.
 
-    train_start = int(total_ticks * fold['train_start_pct'])
-    train_end = int(total_ticks * fold['train_end_pct'])
-    val_start = int(total_ticks * fold['val_start_pct'])
-    val_end = int(total_ticks * fold['val_end_pct'])
-
-    train_ticks = ticks[train_start:train_end]
-    val_ticks = ticks[val_start:val_end]
-
-    return train_ticks, val_ticks
+    Returns VIEWS into the memmap, not copies. Memory stays low.
+    """
+    from core.memmap_prices import slice_memmap_for_fold
+    return slice_memmap_for_fold(prices, fold)
 
 
-def slice_holdout(ticks: List, holdout: Dict) -> List:
-    """Slice tick data for holdout testing."""
-    total_ticks = len(ticks)
-    start = int(total_ticks * holdout['start_pct'])
-    end = int(total_ticks * holdout['end_pct'])
-    return ticks[start:end]
+def slice_prices_for_holdout(prices, holdout: Dict):
+    """
+    Slice memory-mapped prices for holdout testing.
+
+    Returns a VIEW into the memmap, not a copy.
+    """
+    from core.memmap_prices import slice_memmap_for_holdout
+    return slice_memmap_for_holdout(prices, holdout)
+
+
+def prices_to_iterator(price_slice):
+    """
+    Convert a price slice (memmap or list) to iterator for backtest.
+
+    For memmap slices, yields tuples without loading all into RAM.
+    """
+    from core.memmap_prices import memmap_to_iterator
+    import numpy as np
+
+    if isinstance(price_slice, np.ndarray):
+        # Memory-mapped numpy array
+        return memmap_to_iterator(price_slice)
+    else:
+        # Regular list (legacy support)
+        return iter(price_slice)
 
 
 # =============================================================================
@@ -343,18 +365,26 @@ def slice_holdout(ticks: List, holdout: Dict) -> List:
 
 def run_backtest_with_params(
     params: Dict,
-    ticks: List,
+    price_slice,  # Memory-mapped prices array or list
     funding_rates: Dict = None,
     return_rounds: bool = True
 ) -> Dict:
-    """Run backtest with expanded parameters."""
+    """
+    Run backtest with expanded parameters.
+
+    Accepts either a memmap slice or a list of price tuples.
+    Converts to iterator to avoid loading all into RAM.
+    """
     try:
         execution_model = DEFAULT_EXECUTION_MODEL
     except:
         execution_model = None
 
+    # Convert price slice to iterator (memory efficient)
+    price_iter = prices_to_iterator(price_slice)
+
     result = run_pyramid_backtest(
-        prices=ticks,
+        prices=price_iter,
         threshold_pct=params.get('threshold', 5.0),
         trailing_pct=params.get('trailing', 1.0),
         pyramid_step_pct=params.get('pyramid_step', 2.0),
@@ -405,7 +435,7 @@ def run_backtest_with_params(
 
 def calculate_robustness_score(
     params: Dict,
-    ticks: List,
+    prices,  # Memory-mapped prices array
     funding_rates: Optional[Dict] = None
 ) -> Tuple[float, List[Dict]]:
     """
@@ -413,7 +443,7 @@ def calculate_robustness_score(
 
     Returns (robustness_score, perturbation_results).
     """
-    center_result = run_backtest_with_params(params, ticks, funding_rates, return_rounds=False)
+    center_result = run_backtest_with_params(params, prices, funding_rates, return_rounds=False)
     center_pnl = center_result['total_pnl']
 
     if center_pnl <= 0:
@@ -438,7 +468,7 @@ def calculate_robustness_score(
             limits = PARAM_LIMITS.get(param, (0, 100))
             if limits[0] <= new_val <= limits[1]:
                 perturbed[param] = new_val
-                result = run_backtest_with_params(perturbed, ticks, funding_rates, return_rounds=False)
+                result = run_backtest_with_params(perturbed, prices, funding_rates, return_rounds=False)
                 perturbation_results.append({
                     'param': param,
                     'delta': delta,
@@ -461,10 +491,9 @@ def calculate_robustness_score(
 
 def validate_across_all_folds(
     params: Dict,
-    ticks: List,
+    prices,  # Memory-mapped prices array
     folds: List[Dict],
-    funding_rates: Optional[Dict],
-    days: int
+    funding_rates: Optional[Dict]
 ) -> Tuple[bool, List[float], float]:
     """
     Validate parameters across ALL folds (not just fold 0).
@@ -476,8 +505,8 @@ def validate_across_all_folds(
     all_profitable = True
 
     for fold in folds:
-        train_ticks, val_ticks = slice_data_by_fold(ticks, fold, days)
-        val_result = run_backtest_with_params(params, val_ticks, funding_rates, return_rounds=False)
+        train_prices, val_prices = slice_prices_for_fold(prices, fold)
+        val_result = run_backtest_with_params(params, val_prices, funding_rates, return_rounds=False)
         val_pnl = val_result.get('total_pnl', 0)
         fold_pnls.append(val_pnl)
 
@@ -494,7 +523,7 @@ def validate_across_all_folds(
 
 def validate_top_3_candidates(
     results: List[OptimizationResult],
-    ticks: List,
+    prices,  # Memory-mapped prices array
     holdout: Dict,
     funding_rates: Optional[Dict]
 ) -> Tuple[int, bool]:
@@ -503,7 +532,7 @@ def validate_top_3_candidates(
 
     If only 1 passes, it's likely a statistical fluke.
     """
-    holdout_ticks = slice_holdout(ticks, holdout)
+    holdout_prices = slice_prices_for_holdout(prices, holdout)
     top_3 = results[:3] if len(results) >= 3 else results
 
     pass_count = 0
@@ -512,7 +541,7 @@ def validate_top_3_candidates(
     print("\n--- TOP 3 CANDIDATES VALIDATION (Overfitting Guard) ---")
 
     for i, result in enumerate(top_3):
-        holdout_result = run_backtest_with_params(result.params, holdout_ticks, funding_rates, return_rounds=False)
+        holdout_result = run_backtest_with_params(result.params, holdout_prices, funding_rates, return_rounds=False)
         passes, reasons = passes_risk_constraints(holdout_result)
 
         status = "[PASS]" if passes else "[FAIL]"
@@ -541,21 +570,23 @@ def validate_top_3_candidates(
 
 def validate_regime_robustness(
     params: Dict,
-    ticks: List,
+    prices,  # Memory-mapped prices array
     funding_rates: Optional[Dict] = None
 ) -> bool:
     """Validate strategy across different market regimes."""
     try:
         from core.regime_detection import detect_regimes, validate_strategy_across_regimes
 
-        if len(ticks) < 1000:
+        if len(prices) < 1000:
             return True  # Pass if insufficient data
 
-        regime_labels = detect_regimes(ticks, window_size=500)
+        # Convert memmap slice to list for regime detection
+        price_list = list(prices_to_iterator(prices))
+        regime_labels = detect_regimes(price_list, window_size=500)
         if not regime_labels:
             return True
 
-        result = run_backtest_with_params(params, ticks, funding_rates, return_rounds=True)
+        result = run_backtest_with_params(params, prices, funding_rates, return_rounds=True)
         rounds = result.get('rounds', [])
 
         if not rounds:
@@ -642,13 +673,15 @@ def run_optimization(
     print(f"Bonferroni α: {bonferroni_alpha:.2e}")
     print()
 
-    # Load data
-    print("Loading tick data...")
+    # Load data (DISK-BASED - low RAM usage)
+    print("Loading tick data (memory-efficient disk mode)...")
     try:
-        ticks, funding_rates = load_tick_data(symbol, days)
-        print(f"Loaded {len(ticks):,} ticks")
+        prices, meta, funding_rates = load_tick_data_memmap(symbol, days)
+        print(f"Loaded {meta['total_prices']:,} prices (memory-mapped from disk)")
     except Exception as e:
         print(f"Error loading data: {e}")
+        import traceback
+        traceback.print_exc()
         return []
     print()
 
@@ -697,13 +730,13 @@ def run_optimization(
 
             # Test on FOLD 0 first (immediate gate)
             fold = folds[0]
-            train_ticks, val_ticks = slice_data_by_fold(ticks, fold, days)
+            train_prices, val_prices = slice_prices_for_fold(prices, fold)
 
             # Run training backtest
-            train_result = run_backtest_with_params(params, train_ticks, funding_rates)
+            train_result = run_backtest_with_params(params, train_prices, funding_rates)
 
             # IMMEDIATE VALIDATION GATE
-            val_result = run_backtest_with_params(params, val_ticks, funding_rates)
+            val_result = run_backtest_with_params(params, val_prices, funding_rates)
 
             gate_passed, gate_reason = check_validation_gate(
                 train_result, val_result,
@@ -751,7 +784,7 @@ def run_optimization(
 
             # CRITICAL FIX: Validate across ALL folds (not just fold 0)
             all_folds_profitable, fold_pnls, avg_val_pnl = validate_across_all_folds(
-                params, ticks, folds, funding_rates, days
+                params, prices, folds, funding_rates
             )
 
             # Calculate risk-adjusted score
@@ -851,7 +884,7 @@ def run_optimization(
 
     for result in working_results[:20]:
         robustness, perturbations = calculate_robustness_score(
-            result.params, ticks, funding_rates
+            result.params, prices, funding_rates
         )
         result.robustness_score = robustness
 
@@ -874,11 +907,11 @@ def run_optimization(
     print("PHASE 3: HOLDOUT EVALUATION")
     print("=" * 70)
 
-    holdout_ticks = slice_holdout(ticks, holdout)
+    holdout_prices = slice_prices_for_holdout(prices, holdout)
     final_results = []
 
     for result in working_results[:50]:
-        holdout_result = run_backtest_with_params(result.params, holdout_ticks, funding_rates)
+        holdout_result = run_backtest_with_params(result.params, holdout_prices, funding_rates)
 
         result.holdout_metrics = {
             'total_pnl': holdout_result.get('total_pnl', 0),
@@ -898,7 +931,7 @@ def run_optimization(
     # Top 3 validation (from v4)
     if final_results:
         top3_count, top3_all_pass = validate_top_3_candidates(
-            final_results, ticks, holdout, funding_rates
+            final_results, prices, holdout, funding_rates
         )
 
     # PHASE 4: Regime validation (from v4)
@@ -909,7 +942,7 @@ def run_optimization(
 
     for result in final_results[:10]:
         result.regime_pass = validate_regime_robustness(
-            result.params, holdout_ticks, funding_rates
+            result.params, holdout_prices, funding_rates
         )
         status = "[PASS]" if result.regime_pass else "[FAIL]"
         print(f"  {status} th={result.params['threshold']}")
@@ -926,7 +959,7 @@ def run_optimization(
 
             mc_validated = []
             for result in final_results[:20]:
-                holdout_result = run_backtest_with_params(result.params, holdout_ticks, funding_rates)
+                holdout_result = run_backtest_with_params(result.params, holdout_prices, funding_rates)
                 holdout_returns = holdout_result.get('per_round_returns', [])
 
                 if len(holdout_returns) < 10:
