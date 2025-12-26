@@ -904,8 +904,9 @@ def run_streaming_grid_search(
                     poll = 0 if poll == 'tick' else float(poll.replace('s', ''))
 
                 # Stream from disk and aggregate
-                tick_stream = create_disk_streamer(cache_file)
-                aggregated = aggregate_ticks_to_interval(tick_stream, poll)
+                # NOTE: aggregate_ticks_to_interval expects a CALLABLE, not a generator
+                tick_streamer = lambda cf=cache_file: create_disk_streamer(cf)
+                aggregated = aggregate_ticks_to_interval(tick_streamer, poll)
 
                 # Get time_decay value
                 time_decay = full_params.get('time_decay')
@@ -1031,8 +1032,9 @@ def run_single_backtest_streaming(
         max_pyr = 9999
 
     # Stream from disk
-    tick_stream = create_disk_streamer(cache_file)
-    aggregated = aggregate_ticks_to_interval(tick_stream, poll)
+    # NOTE: aggregate_ticks_to_interval expects a CALLABLE, not a generator
+    tick_streamer = lambda cf=cache_file: create_disk_streamer(cf)
+    aggregated = aggregate_ticks_to_interval(tick_streamer, poll)
 
     result = run_pyramid_backtest(
         aggregated,
