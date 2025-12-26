@@ -1700,10 +1700,20 @@ def main():
         if VALIDATE_DATA_QUALITY:
             print("\n  Validating data quality...")
             try:
-                quality_report = validate_data_quality(tick_streamer)
+                # FIX: validate_data_quality expects List, not callable
+                # Sample first 100k ticks for quality check (avoids loading entire dataset)
+                sample_ticks = []
+                for i, tick in enumerate(tick_streamer()):
+                    sample_ticks.append(tick)
+                    if i >= 100_000:
+                        break
+
+                quality_report = validate_data_quality(sample_ticks)
                 if quality_report:
-                    print(f"  Data quality: {quality_report.quality_score:.1f}%")
-                    if quality_report.quality_score < 80:
+                    # Calculate quality score from report attributes
+                    quality_score = quality_report.quality_score
+                    print(f"  Data quality: {quality_score:.1f}%")
+                    if quality_score < 80:
                         print("  WARNING: Data quality below 80%, results may be unreliable")
                     if quality_report.gap_count > 0:
                         print(f"  Detected {quality_report.gap_count} data gaps")

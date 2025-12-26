@@ -1258,6 +1258,38 @@ class DataQualityReport:
         if self.warnings is None:
             self.warnings = []
 
+    @property
+    def quality_score(self) -> float:
+        """
+        Calculate overall data quality score (0-100).
+
+        Scoring:
+        - Start at 100
+        - Deduct 5 points per gap over 1 hour
+        - Deduct 20 points per gap over 24 hours
+        - Deduct 10 points per flash crash
+        - Deduct 50 points if data is invalid
+        - Minimum score is 0
+        """
+        score = 100.0
+
+        # Penalize gaps
+        score -= len(self.gaps_over_1h) * 5
+        score -= len(self.gaps_over_24h) * 20
+
+        # Penalize flash crashes
+        score -= self.flash_crash_count * 10
+
+        # Penalize anomalies
+        score -= self.zero_price_count * 20
+        score -= self.negative_price_count * 50
+
+        # Invalid data is heavily penalized
+        if not self.is_valid:
+            score -= 50
+
+        return max(0.0, min(100.0, score))
+
 
 def validate_data_quality(
     prices: List[Tuple[datetime, float]],
