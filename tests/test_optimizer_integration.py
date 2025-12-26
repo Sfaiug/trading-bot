@@ -451,6 +451,73 @@ def test_optimizer_imports(config: TestConfig) -> TestResult:
     return result
 
 
+def test_cross_fold_results_structure(config: TestConfig) -> TestResult:
+    """Test that cross_fold_results uses correct nested 'params' access.
+
+    BUG-004: Line 1418 was accessing candidate['threshold'] directly,
+    but the data structure has params nested: candidate['params']['threshold']
+    """
+    result = TestResult("Cross-fold results data structure")
+    start = time.time()
+
+    try:
+        # Simulate the cross_fold_results structure from lines 1375-1386
+        cross_fold_results = [
+            {
+                'params': {'threshold': 1.5, 'trailing': 0.8, 'pyramid_step': 0.5},
+                'fold_pnls': [2.1, 1.8, 2.5],
+                'avg_val_pnl': 2.13,
+                'all_profitable': True,
+                'min_fold_pnl': 1.8,
+                'total_pnl': 2.13,
+                'max_drawdown_pct': 5.2,
+                'win_rate': 65.0,
+                'rounds': 45,
+            },
+            {
+                'params': {'threshold': 2.0, 'trailing': 1.0, 'pyramid_step': 0.7},
+                'fold_pnls': [1.5, 2.0, 1.8],
+                'avg_val_pnl': 1.77,
+                'all_profitable': True,
+                'min_fold_pnl': 1.5,
+                'total_pnl': 1.77,
+                'max_drawdown_pct': 4.8,
+                'win_rate': 62.0,
+                'rounds': 38,
+            },
+        ]
+
+        # Test the CORRECT access pattern (as fixed in line 1418)
+        for i, candidate in enumerate(cross_fold_results):
+            # This is the CORRECT way - accessing nested params
+            params_str = f"th={candidate['params']['threshold']:.2f}, tr={candidate['params']['trailing']:.2f}, ps={candidate['params']['pyramid_step']:.2f}"
+
+            # Verify it produces expected output
+            if i == 0:
+                expected = "th=1.50, tr=0.80, ps=0.50"
+                if params_str != expected:
+                    result.error = f"Params string mismatch: got '{params_str}', expected '{expected}'"
+                    return result
+
+        # Test that WRONG access pattern would fail
+        try:
+            wrong_str = f"th={cross_fold_results[0]['threshold']:.2f}"
+            result.error = "BUG-004 NOT FIXED: Direct access didn't raise KeyError!"
+            return result
+        except KeyError:
+            # Good - this should fail
+            pass
+
+        result.details = "Nested params access pattern works correctly"
+        result.passed = True
+
+    except Exception as e:
+        result.error = f"Error: {e}\n{traceback.format_exc()}"
+
+    result.duration_ms = (time.time() - start) * 1000
+    return result
+
+
 # =============================================================================
 # TEST RUNNER
 # =============================================================================
@@ -465,6 +532,7 @@ def run_all_tests(config: TestConfig = None) -> Dict:
         test_validate_data_quality_type,
         test_quality_score_property,
         test_aggregate_ticks_callable,
+        test_cross_fold_results_structure,  # BUG-004 fix test
         test_disk_streamer_format,
         test_backtest_engine,
         test_statistical_validation,

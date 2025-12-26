@@ -1415,7 +1415,8 @@ def run_multi_fold_optimization(
     for i, candidate in enumerate(top_3_candidates):
         passes, reasons = passes_risk_constraints(candidate)
         status = "[PASS]" if passes else "[FAIL]"
-        params_str = f"th={candidate['threshold']:.2f}, tr={candidate['trailing']:.2f}, ps={candidate['pyramid_step']:.2f}"
+        # FIX: Access nested 'params' dict, not top-level candidate dict
+        params_str = f"th={candidate['params']['threshold']:.2f}, tr={candidate['params']['trailing']:.2f}, ps={candidate['params']['pyramid_step']:.2f}"
         print(f"  Top {i+1}: {status} ({params_str})")
         if passes:
             top_3_pass_count += 1
