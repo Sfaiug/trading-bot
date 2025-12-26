@@ -989,8 +989,8 @@ def run_pyramid_backtest(
     # FUNDING RATE PARAMETERS (Phase 1.2 fix):
     funding_rates: Optional[Dict[datetime, float]] = None,  # Funding rate lookup {time: rate%}
     apply_funding: bool = True,  # Apply funding rate costs when available
-    # MEMORY OPTIMIZATION:
-    return_rounds: bool = True,  # Set False to skip accumulating round objects (saves memory)
+    # MEMORY OPTIMIZATION (DEPRECATED - always True now for statistical validity):
+    return_rounds: bool = True,  # DEPRECATED: Always True. Per-round data required for Monte Carlo
     # NEW EXIT CONTROLS (Phase 6):
     take_profit_pct: Optional[float] = None,  # Exit at fixed profit % (None = disabled)
     stop_loss_pct: Optional[float] = None,  # Hard stop loss % (None = disabled)
@@ -1041,8 +1041,8 @@ def run_pyramid_backtest(
         funding_rates: Dict mapping datetime to funding rate percentage
         apply_funding: If True and funding_rates provided, deduct funding from P&L
 
-        # MEMORY:
-        return_rounds: If False, skip accumulating round objects (saves memory in grid search)
+        # MEMORY (DEPRECATED):
+        return_rounds: DEPRECATED - always True. Per-round data required for Monte Carlo validation
 
     Returns:
         Dictionary with backtest results including:
@@ -1050,8 +1050,9 @@ def run_pyramid_backtest(
         - Margin metrics (final_equity, max_drawdown_pct, liquidation_events) if use_margin_tracking
         - Funding metrics (total_funding_paid, net_funding_impact) if funding_rates provided
     """
-    # Only accumulate rounds if requested (saves memory in grid search)
-    rounds: List[PyramidRound] = [] if return_rounds else None
+    # Always accumulate rounds for statistical validity (Monte Carlo, Sharpe)
+    # return_rounds parameter is DEPRECATED - per-round data now required
+    rounds: List[PyramidRound] = []
 
     # Initialize margin state (Phase 1.1 fix)
     margin_state: Optional[MarginState] = None
@@ -1674,20 +1675,19 @@ def run_pyramid_backtest(
                         print(f"[{timestamp}] {exit_reason} @ ${price:.2f} | Pyramids: {len(pyramid_positions)} | "
                               f"Max: {max_profit_pct:+.2f}% | Profit: {profit_from_entry:+.2f}% | Round P&L: {round_pnl:+.2f}%{margin_info}")
 
-                # Record round (only if return_rounds=True to save memory)
-                if return_rounds:
-                    rounds.append(PyramidRound(
-                        entry_price=round_entry_price,
-                        entry_time=round_entry_time,
-                        direction=direction,
-                        pyramid_reference=pyramid_reference,
-                        positions=pyramid_positions.copy(),
-                        max_profit_pct=max_profit_pct,
-                        exit_price=price,
-                        exit_time=timestamp,
-                        total_pnl=round_pnl,
-                        num_pyramids=len(pyramid_positions)
-                    ))
+                # Record round (always, for statistical validity)
+                rounds.append(PyramidRound(
+                    entry_price=round_entry_price,
+                    entry_time=round_entry_time,
+                    direction=direction,
+                    pyramid_reference=pyramid_reference,
+                    positions=pyramid_positions.copy(),
+                    max_profit_pct=max_profit_pct,
+                    exit_price=price,
+                    exit_time=timestamp,
+                    total_pnl=round_pnl,
+                    num_pyramids=len(pyramid_positions)
+                ))
 
                 # Reset for next round
                 pyramid_positions = []
@@ -1724,8 +1724,9 @@ def run_pyramid_backtest(
             result['total_funding_received'] = total_funding_received
             result['net_funding_impact'] = total_funding_received - total_funding_paid
             result['funding_events'] = funding_events
-        if return_rounds:
-            result['rounds'] = []
+        # Always include rounds and per_round_returns (required for Monte Carlo)
+        result['rounds'] = []
+        result['per_round_returns'] = []
         return result
 
     # Calculate avg_pyramids from tracked total (works regardless of return_rounds)
@@ -1769,9 +1770,16 @@ def run_pyramid_backtest(
             # Approximate funding impact as % of total P&L
             result['funding_impact_pct'] = (net_funding_usdt / initial_capital) * 100 if initial_capital > 0 else 0
 
-    # Only include rounds list if requested (saves memory in grid search)
-    if return_rounds:
-        result['rounds'] = rounds
+    # Always include rounds and per_round_returns (required for Monte Carlo/Sharpe)
+    result['rounds'] = rounds
+    result['per_round_returns'] = [r.total_pnl for r in rounds]
+
+    # Add round durations for Sharpe annualization
+    result['round_durations_sec'] = [
+        (r.exit_time - r.entry_time).total_seconds()
+        for r in rounds
+        if r.exit_time and r.entry_time
+    ]
 
     return result
 
