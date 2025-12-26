@@ -924,6 +924,41 @@ def _calculate_volatility(prices: deque, method: str) -> float:
     return float('inf')
 
 
+def _is_session_active(timestamp: datetime, session_filter: str) -> bool:
+    """
+    Check if current timestamp is within the specified trading session.
+
+    Sessions are defined in UTC:
+    - 'all': No filter, always active
+    - 'asia': 00:00-08:00 UTC (Tokyo/Singapore/Hong Kong)
+    - 'europe': 07:00-16:00 UTC (London/Frankfurt)
+    - 'us': 13:00-22:00 UTC (New York)
+
+    Args:
+        timestamp: Current tick timestamp
+        session_filter: 'all', 'asia', 'europe', 'us'
+
+    Returns:
+        True if current time is within the session
+    """
+    if session_filter == 'all':
+        return True
+
+    hour = timestamp.hour
+
+    if session_filter == 'asia':
+        # Tokyo open 00:00 UTC, Hong Kong closes ~08:00 UTC
+        return 0 <= hour < 8
+    elif session_filter == 'europe':
+        # London open ~07:00 UTC, closes ~16:00 UTC
+        return 7 <= hour < 16
+    elif session_filter == 'us':
+        # NY open ~13:00 UTC, closes ~22:00 UTC
+        return 13 <= hour < 22
+
+    return True  # Default to active if unknown session
+
+
 def run_pyramid_backtest(
     prices: Iterable[Tuple[datetime, float]],
     threshold_pct: float,
@@ -955,7 +990,17 @@ def run_pyramid_backtest(
     funding_rates: Optional[Dict[datetime, float]] = None,  # Funding rate lookup {time: rate%}
     apply_funding: bool = True,  # Apply funding rate costs when available
     # MEMORY OPTIMIZATION:
-    return_rounds: bool = True  # Set False to skip accumulating round objects (saves memory)
+    return_rounds: bool = True,  # Set False to skip accumulating round objects (saves memory)
+    # NEW EXIT CONTROLS (Phase 6):
+    take_profit_pct: Optional[float] = None,  # Exit at fixed profit % (None = disabled)
+    stop_loss_pct: Optional[float] = None,  # Hard stop loss % (None = disabled)
+    breakeven_after_pct: Optional[float] = None,  # Move stop to breakeven after X% profit (None = disabled)
+    # NEW TIMING CONTROLS (Phase 6):
+    pyramid_cooldown_sec: int = 0,  # Min seconds between pyramid entries (0 = disabled)
+    max_round_duration_hr: Optional[float] = None,  # Force exit after X hours (None = disabled)
+    # NEW FILTERS (Phase 6):
+    trend_filter_ema: Optional[int] = None,  # EMA period for trend filter (None = disabled)
+    session_filter: str = 'all',  # Trading session: 'all', 'asia', 'europe', 'us'
 ) -> Dict:
     """
     Run pyramid strategy backtest.
@@ -1067,6 +1112,12 @@ def run_pyramid_backtest(
     recent_prices: deque = deque(maxlen=volatility_window_size)  # For volatility filter
     current_volatility: float = 0.0  # For execution model
 
+    # NEW: State for Phase 6 parameters
+    last_pyramid_time: datetime = None  # For pyramid_cooldown_sec
+    ema_value: float = None  # For trend_filter_ema
+    ema_multiplier: float = 2.0 / (trend_filter_ema + 1) if trend_filter_ema else 0  # EMA smoothing factor
+    breakeven_activated: bool = False  # For breakeven_after_pct
+
     # Track position notionals for margin (Phase 1.1)
     position_notionals: Dict[int, float] = {}  # position_id -> notional_value
 
@@ -1093,6 +1144,15 @@ def run_pyramid_backtest(
             current_volatility = _calculate_volatility(recent_prices, 'stddev')
             if current_volatility == float('inf'):
                 current_volatility = 0.0
+
+        # Phase 6: Update EMA for trend filter
+        if trend_filter_ema is not None:
+            if ema_value is None:
+                # Initialize EMA with first price
+                ema_value = price
+            else:
+                # EMA = price * multiplier + ema_prev * (1 - multiplier)
+                ema_value = price * ema_multiplier + ema_value * (1 - ema_multiplier)
 
         # === PHASE 1.2: Apply funding rate every 8 hours ===
         # PHASE 5 FIX: More precise funding timing
@@ -1174,6 +1234,16 @@ def run_pyramid_backtest(
 
         # === PHASE 1: Open initial hedge if no positions ===
         if long_pos is None and short_pos is None and not pyramid_positions:
+            # Phase 6: Check session filter before opening hedge
+            if not _is_session_active(timestamp, session_filter):
+                continue  # Skip hedge opening outside trading session
+
+            # Phase 6: Check trend filter before opening hedge
+            # For hedges, we don't filter by trend since we're market-neutral initially
+            # But if trend_filter_ema is set, wait until EMA is established (needs warmup)
+            if trend_filter_ema is not None and ema_value is None:
+                continue  # Wait for EMA to initialize
+
             # Calculate notional for hedge (2 positions)
             hedge_notional = position_size_usdt * 2
 
@@ -1200,6 +1270,10 @@ def run_pyramid_backtest(
             max_profit_pct = 0.0
             next_pyramid_level = 1
             last_pyramid_price = 0.0  # Reset for min_pyramid_spacing
+
+            # Phase 6: Reset state for new round
+            breakeven_activated = False  # Reset breakeven trigger
+            last_pyramid_time = None  # Reset pyramid cooldown
 
             # Initialize causal trailing state (Phase 1 fix)
             trailing_state = CausalTrailingState()
@@ -1302,6 +1376,13 @@ def run_pyramid_backtest(
             if profit_from_entry > max_profit_pct:
                 max_profit_pct = profit_from_entry
 
+            # Phase 6: Check and activate breakeven stop
+            if breakeven_after_pct is not None and not breakeven_activated:
+                if profit_from_entry >= breakeven_after_pct:
+                    breakeven_activated = True
+                    if verbose:
+                        print(f"[{timestamp}] BREAKEVEN activated @ {profit_from_entry:.2f}% (trigger: {breakeven_after_pct}%)")
+
             # Check for new pyramid level
             if len(pyramid_positions) < max_pyramids:
                 # Calculate how far price has moved from pyramid reference
@@ -1335,7 +1416,33 @@ def run_pyramid_backtest(
                     current_vol = _calculate_volatility(recent_prices, volatility_filter_type)
                     volatility_ok = current_vol >= volatility_min_pct
 
-                    if spacing_ok and volatility_ok:
+                    # Phase 6: Check pyramid cooldown (time since last pyramid)
+                    cooldown_ok = True
+                    if pyramid_cooldown_sec > 0 and last_pyramid_time is not None:
+                        seconds_since_last = (timestamp - last_pyramid_time).total_seconds()
+                        cooldown_ok = seconds_since_last >= pyramid_cooldown_sec
+                        if not cooldown_ok and verbose:
+                            print(f"[{timestamp}] PYRAMID SKIPPED (cooldown {seconds_since_last:.0f}s < {pyramid_cooldown_sec}s)")
+
+                    # Phase 6: Check session filter for pyramids
+                    session_ok = _is_session_active(timestamp, session_filter)
+                    if not session_ok and verbose:
+                        print(f"[{timestamp}] PYRAMID SKIPPED (outside {session_filter} session)")
+
+                    # Phase 6: Check trend filter (only add pyramids with trend)
+                    trend_ok = True
+                    if trend_filter_ema is not None and ema_value is not None:
+                        if is_long:
+                            # For long pyramids, price should be above EMA (uptrend)
+                            trend_ok = price > ema_value
+                        else:
+                            # For short pyramids, price should be below EMA (downtrend)
+                            trend_ok = price < ema_value
+                        if not trend_ok and verbose:
+                            trend_dir = "above" if is_long else "below"
+                            print(f"[{timestamp}] PYRAMID SKIPPED (price {price:.2f} not {trend_dir} EMA {ema_value:.2f})")
+
+                    if spacing_ok and volatility_ok and cooldown_ok and session_ok and trend_ok:
                         # Add new pyramid position with calculated size
                         pyramid_level = len(pyramid_positions) + 1
                         pos_size = _calculate_pyramid_size(pyramid_level, pyramid_size_schedule)
@@ -1376,6 +1483,7 @@ def run_pyramid_backtest(
                             )
                             pyramid_positions.append(new_pos)
                             last_pyramid_price = actual_entry_price  # Track for spacing check
+                            last_pyramid_time = timestamp  # Phase 6: Track for cooldown
 
                             # Reserve margin for pyramid position (Phase 1.1)
                             if margin_state is not None:
@@ -1450,7 +1558,37 @@ def run_pyramid_backtest(
                 trigger_profit = max_profit_pct - trailing_pct
                 trail_exit = profit_from_entry <= trigger_profit
 
-            if time_exit or trail_exit or liquidation_exit:
+            # Phase 6: Check take profit exit
+            take_profit_exit = False
+            if take_profit_pct is not None and profit_from_entry >= take_profit_pct:
+                take_profit_exit = True
+                if verbose:
+                    print(f"[{timestamp}] TAKE PROFIT triggered @ {profit_from_entry:.2f}% (target: {take_profit_pct}%)")
+
+            # Phase 6: Check stop loss exit
+            stop_loss_exit = False
+            if stop_loss_pct is not None and profit_from_entry <= -stop_loss_pct:
+                stop_loss_exit = True
+                if verbose:
+                    print(f"[{timestamp}] STOP LOSS triggered @ {profit_from_entry:.2f}% (limit: -{stop_loss_pct}%)")
+
+            # Phase 6: Check max round duration exit
+            max_duration_exit = False
+            if max_round_duration_hr is not None and round_start_time is not None:
+                hours_elapsed = (timestamp - round_start_time).total_seconds() / 3600.0
+                if hours_elapsed >= max_round_duration_hr:
+                    max_duration_exit = True
+                    if verbose:
+                        print(f"[{timestamp}] MAX DURATION triggered @ {hours_elapsed:.1f}hr (limit: {max_round_duration_hr}hr)")
+
+            # Phase 6: Check breakeven exit (if breakeven was activated and profit drops below 0)
+            breakeven_exit = False
+            if breakeven_activated and profit_from_entry <= 0:
+                breakeven_exit = True
+                if verbose:
+                    print(f"[{timestamp}] BREAKEVEN EXIT triggered @ {profit_from_entry:.2f}% (was activated at {breakeven_after_pct}%)")
+
+            if time_exit or trail_exit or liquidation_exit or take_profit_exit or stop_loss_exit or max_duration_exit or breakeven_exit:
                 # Close all pyramid positions
                 round_pnl = 0.0
                 exit_cost = get_cost(current_volatility, is_entry=False)
@@ -1511,6 +1649,14 @@ def run_pyramid_backtest(
                 if verbose:
                     if liquidation_exit:
                         exit_reason = "LIQUIDATION"
+                    elif take_profit_exit:
+                        exit_reason = "TAKE PROFIT"
+                    elif stop_loss_exit:
+                        exit_reason = "STOP LOSS"
+                    elif breakeven_exit:
+                        exit_reason = "BREAKEVEN"
+                    elif max_duration_exit:
+                        exit_reason = "MAX DURATION"
                     elif time_exit:
                         exit_reason = "TIME DECAY"
                     else:

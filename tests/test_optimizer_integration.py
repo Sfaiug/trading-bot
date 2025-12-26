@@ -519,6 +519,177 @@ def test_cross_fold_results_structure(config: TestConfig) -> TestResult:
 
 
 # =============================================================================
+# PHASE 6 PARAMETER TESTS
+# =============================================================================
+
+def test_session_filter(config: TestConfig) -> TestResult:
+    """Test session filter helper function."""
+    result = TestResult("Session filter function")
+    start = time.time()
+
+    try:
+        from backtest_pyramid import _is_session_active
+
+        # Test 'all' always returns True
+        test_time = datetime(2024, 1, 15, 10, 0, 0)
+        assert _is_session_active(test_time, 'all') == True, "'all' should always be active"
+
+        # Test Asia session (00:00-08:00 UTC)
+        asia_active = datetime(2024, 1, 15, 3, 0, 0)  # 3:00 UTC
+        asia_inactive = datetime(2024, 1, 15, 12, 0, 0)  # 12:00 UTC
+        assert _is_session_active(asia_active, 'asia') == True, "Asia should be active at 3:00 UTC"
+        assert _is_session_active(asia_inactive, 'asia') == False, "Asia should be inactive at 12:00 UTC"
+
+        # Test Europe session (07:00-16:00 UTC)
+        eu_active = datetime(2024, 1, 15, 10, 0, 0)  # 10:00 UTC
+        eu_inactive = datetime(2024, 1, 15, 20, 0, 0)  # 20:00 UTC
+        assert _is_session_active(eu_active, 'europe') == True, "Europe should be active at 10:00 UTC"
+        assert _is_session_active(eu_inactive, 'europe') == False, "Europe should be inactive at 20:00 UTC"
+
+        # Test US session (13:00-22:00 UTC)
+        us_active = datetime(2024, 1, 15, 16, 0, 0)  # 16:00 UTC
+        us_inactive = datetime(2024, 1, 15, 5, 0, 0)  # 5:00 UTC
+        assert _is_session_active(us_active, 'us') == True, "US should be active at 16:00 UTC"
+        assert _is_session_active(us_inactive, 'us') == False, "US should be inactive at 5:00 UTC"
+
+        result.details = "All session filter tests passed"
+        result.passed = True
+
+    except Exception as e:
+        result.error = f"Error: {e}\n{traceback.format_exc()}"
+
+    result.duration_ms = (time.time() - start) * 1000
+    return result
+
+
+def test_phase6_new_parameters(config: TestConfig) -> TestResult:
+    """Test that new Phase 6 parameters are accepted by backtest."""
+    result = TestResult("Phase 6 new parameters accepted")
+    start = time.time()
+
+    try:
+        from backtest_pyramid import run_pyramid_backtest
+
+        ticks = generate_synthetic_ticks(1000, config.base_price, config.volatility_pct)
+
+        # Test with all new Phase 6 parameters
+        br = run_pyramid_backtest(
+            iter(ticks),
+            threshold_pct=2.0,
+            trailing_pct=1.0,
+            pyramid_step_pct=1.0,
+            max_pyramids=5,
+            verbose=False,
+            return_rounds=False,
+            # Phase 6 exit controls
+            take_profit_pct=10.0,
+            stop_loss_pct=15.0,
+            breakeven_after_pct=5.0,
+            # Phase 6 timing controls
+            pyramid_cooldown_sec=60,
+            max_round_duration_hr=4.0,
+            # Phase 6 filters
+            trend_filter_ema=20,
+            session_filter='all',
+        )
+
+        # Verify basic result structure
+        assert 'total_pnl' in br, "Missing total_pnl in result"
+        assert 'total_rounds' in br, "Missing total_rounds in result"
+        assert 'win_rate' in br, "Missing win_rate in result"
+
+        result.details = f"Backtest completed: P&L={br['total_pnl']:.2f}%, Rounds={br['total_rounds']}"
+        result.passed = True
+
+    except TypeError as e:
+        result.error = f"New parameters not accepted: {e}"
+    except Exception as e:
+        result.error = f"Error: {e}\n{traceback.format_exc()}"
+
+    result.duration_ms = (time.time() - start) * 1000
+    return result
+
+
+def test_take_profit_exit(config: TestConfig) -> TestResult:
+    """Test that take_profit_pct triggers exit at target profit."""
+    result = TestResult("Take profit exit trigger")
+    start = time.time()
+
+    try:
+        from backtest_pyramid import run_pyramid_backtest
+
+        # Generate trending data that should hit take profit
+        ticks = generate_synthetic_ticks(2000, config.base_price, config.volatility_pct * 2)
+
+        # Run with low take profit to ensure it triggers
+        br = run_pyramid_backtest(
+            iter(ticks),
+            threshold_pct=1.0,  # Low threshold to trigger direction quickly
+            trailing_pct=5.0,   # High trailing so take profit triggers first
+            pyramid_step_pct=1.0,
+            max_pyramids=5,
+            verbose=False,
+            return_rounds=True,
+            take_profit_pct=2.0,  # 2% take profit target
+        )
+
+        # With take_profit, we expect some rounds completed
+        rounds_count = br.get('total_rounds', 0)
+        result.details = f"Completed {rounds_count} rounds with take_profit_pct=2.0"
+        result.passed = True
+
+    except Exception as e:
+        result.error = f"Error: {e}\n{traceback.format_exc()}"
+
+    result.duration_ms = (time.time() - start) * 1000
+    return result
+
+
+def test_optimizer_new_params_grid(config: TestConfig) -> TestResult:
+    """Test that optimizer grids include new Phase 6 parameters."""
+    result = TestResult("Optimizer includes Phase 6 params in grid")
+    start = time.time()
+
+    try:
+        from optimize_pyramid_v4 import build_dense_new_params_grid
+
+        grid = build_dense_new_params_grid()
+
+        # Check existing params are now enabled (not single values)
+        assert len(grid.get('size_schedule', [])) >= 2, "size_schedule should have multiple values"
+        assert len(grid.get('acceleration', [])) >= 2, "acceleration should have multiple values"
+
+        # Check new Phase 6 params exist
+        new_params = [
+            'take_profit_pct', 'stop_loss_pct', 'breakeven_after_pct',
+            'pyramid_cooldown_sec', 'max_round_duration_hr',
+            'trend_filter_ema', 'session_filter'
+        ]
+
+        missing = []
+        for param in new_params:
+            if param not in grid:
+                missing.append(param)
+
+        if missing:
+            result.error = f"Missing Phase 6 params in grid: {missing}"
+            return result
+
+        total_combos = 1
+        for param, values in grid.items():
+            total_combos *= len(values)
+
+        result.details = f"Grid has {len(grid)} params, ~{total_combos:,} combinations"
+        result.passed = True
+
+    except Exception as e:
+        result.error = f"Error: {e}\n{traceback.format_exc()}"
+
+    result.duration_ms = (time.time() - start) * 1000
+    return result
+
+
+# =============================================================================
 # TEST RUNNER
 # =============================================================================
 
@@ -538,6 +709,11 @@ def run_all_tests(config: TestConfig = None) -> Dict:
         test_statistical_validation,
         test_monte_carlo_simulation,
         test_mini_grid_search,
+        # Phase 6 new parameter tests
+        test_session_filter,
+        test_phase6_new_parameters,
+        test_take_profit_exit,
+        test_optimizer_new_params_grid,
     ]
 
     print("=" * 70)

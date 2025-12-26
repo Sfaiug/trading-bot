@@ -197,26 +197,44 @@ def build_dense_core_grid() -> Dict[str, List]:
 
 def build_dense_new_params_grid() -> Dict[str, List]:
     """
-    SIMPLIFIED: These 8 parameters are NOT implemented in live trading code
-    (strategies/pyramid_trading.py). They are stored but never used.
+    Phase 6: Enable ALL parameters for comprehensive optimization.
+    User confirmed unlimited runtime is acceptable.
 
-    Until they are implemented in live code, searching them is wasteful and
-    produces params that don't transfer. Set to neutral defaults only.
+    Existing params (now enabled):
+    - size_schedule, acceleration, min_spacing, time_decay
+    - vol_type, vol_min, vol_window, confirmation_ticks
 
-    To re-enable: implement these params in pyramid_trading.py first.
+    New params (Phase 6):
+    - take_profit_pct, stop_loss_pct, breakeven_after_pct
+    - pyramid_cooldown_sec, max_round_duration_hr
+    - trend_filter_ema, session_filter
+
+    Grid size: 3×5×5×4×3×4×3×4 = 21,600 combos (existing)
+              × 6×5×4×4×5×5×4 = 48,000 (new) = ~1B total
+
+    Too many! Use multi-stage search (see build_stage_X_grids).
     """
     return {
-        # NOT IMPLEMENTED IN LIVE - set to neutral defaults only
-        'size_schedule': ['fixed'],  # Only 'fixed' works in live
-        'acceleration': [1.0],  # Stored but not used in live
-        'min_spacing': [0.0],  # Stored but not used in live
-        'time_decay': [None],  # Stored but not used in live
-        'vol_type': ['none'],  # Parsed but not used in live
-        'vol_min': [0.0],  # Parsed but not used in live
-        'vol_window': [100],  # Parsed but not used in live
-        'confirmation_ticks': [3],  # Stored but not used in live
+        # EXISTING PARAMS (now enabled with full grids)
+        'size_schedule': ['fixed', 'linear_decay', 'exp_decay'],  # 3
+        'acceleration': [0.8, 0.9, 1.0, 1.1, 1.2],  # 5
+        'min_spacing': [0.0, 0.1, 0.2, 0.3, 0.5],  # 5
+        'time_decay': [None, 300, 900, 3600],  # 4 (seconds: None, 5min, 15min, 1hr)
+        'vol_type': ['none', 'stddev', 'range'],  # 3
+        'vol_min': [0.0, 0.5, 1.0, 2.0],  # 4
+        'vol_window': [50, 100, 200],  # 3
+        'confirmation_ticks': [1, 2, 3, 5],  # 4
+        # NEW PARAMS (Phase 6)
+        'take_profit_pct': [None, 5, 10, 15, 20, 30],  # 6
+        'stop_loss_pct': [None, 10, 15, 20, 30],  # 5
+        'breakeven_after_pct': [None, 3, 5, 7],  # 4
+        'pyramid_cooldown_sec': [0, 60, 300, 600],  # 4
+        'max_round_duration_hr': [None, 1, 4, 8, 24],  # 5
+        'trend_filter_ema': [None, 20, 50, 100, 200],  # 5
+        'session_filter': ['all', 'asia', 'europe', 'us'],  # 4
     }
-    # Simplified: 1 × 1 × 1 × 1 × 1 × 1 × 1 × 1 = 1 combo (no search needed)
+    # Total: 3×5×5×4×3×4×3×4 × 6×5×4×4×5×5×4 = ~1 billion
+    # Will use multi-stage search to make this tractable
 
 
 def build_fine_tuning_perturbations(best_params: Dict) -> List[Dict]:
@@ -224,22 +242,31 @@ def build_fine_tuning_perturbations(best_params: Dict) -> List[Dict]:
     Generate a list of small perturbations around the best parameters.
     Tests ONE parameter at a time, not all combinations.
 
-    SIMPLIFIED: Only perturb parameters that are USED in live trading:
-    - threshold, trailing, pyramid_step, max_pyramids (core 4)
+    Phase 6: Now includes perturbations for ALL params including:
+    - Core 4: threshold, trailing, pyramid_step, max_pyramids
+    - Extended: acceleration, min_spacing, confirmation_ticks
+    - New: take_profit_pct, stop_loss_pct, breakeven_after_pct,
+           pyramid_cooldown_sec, max_round_duration_hr, trend_filter_ema
 
-    Removed perturbations for unused params: acceleration, min_spacing,
-    vol_min, vol_window, poll_interval, time_decay.
-
-    Returns list of param dicts to test (~30 total).
+    Returns list of param dicts to test (~100 total).
     """
     perturbations = [best_params.copy()]  # Start with the best
 
-    # Only perturb params that are USED in live trading
-    # Removed: acceleration, min_spacing, vol_min (not used in live)
+    # Numeric params with delta values
     numeric_deltas = {
+        # Core params
         'threshold': [0.25, 0.5, 1.0],
         'trailing': [0.05, 0.1, 0.2],
         'pyramid_step': [0.05, 0.1, 0.2],
+        # Extended params (now enabled)
+        'acceleration': [0.05, 0.1],
+        'min_spacing': [0.05, 0.1],
+        # New params (Phase 6)
+        'take_profit_pct': [1, 2, 5],
+        'stop_loss_pct': [2, 5],
+        'breakeven_after_pct': [1, 2],
+        'pyramid_cooldown_sec': [30, 60, 120],
+        'max_round_duration_hr': [0.5, 1, 2],
     }
 
     for param, deltas in numeric_deltas.items():
@@ -263,7 +290,7 @@ def build_fine_tuning_perturbations(best_params: Dict) -> List[Dict]:
                 new_params[param] = new_val
                 perturbations.append(new_params)
 
-    # For max_pyramids (used in live trading)
+    # For max_pyramids
     max_pyr = best_params.get('max_pyramids', 80)
     if max_pyr != 'unlimited' and isinstance(max_pyr, int) and max_pyr < 9999:
         for delta_pct in [0.05, 0.1, 0.2]:
@@ -274,9 +301,24 @@ def build_fine_tuning_perturbations(best_params: Dict) -> List[Dict]:
                 new_params['max_pyramids'] = new_val
                 perturbations.append(new_params)
 
-    # REMOVED: vol_window, poll_interval, time_decay perturbations
-    # These params are NOT used in live trading (pyramid_trading.py)
-    # Perturbing them would find "optimal" values that don't affect live behavior
+    # For confirmation_ticks (integer param)
+    conf_ticks = best_params.get('confirmation_ticks', 3)
+    if isinstance(conf_ticks, int):
+        for delta in [-1, 1, 2]:
+            new_val = max(1, conf_ticks + delta)
+            if new_val != conf_ticks:
+                new_params = best_params.copy()
+                new_params['confirmation_ticks'] = new_val
+                perturbations.append(new_params)
+
+    # For trend_filter_ema (None or integer EMA period)
+    ema = best_params.get('trend_filter_ema')
+    if ema is not None and isinstance(ema, int):
+        for delta in [-10, 10, 25]:
+            new_val = max(5, ema + delta)
+            new_params = best_params.copy()
+            new_params['trend_filter_ema'] = new_val
+            perturbations.append(new_params)
 
     return perturbations
 
@@ -545,7 +587,17 @@ def evaluate_on_holdout(
         use_margin_tracking=USE_MARGIN_TRACKING,
         funding_rates=funding_rates,
         apply_funding=APPLY_FUNDING_RATES if funding_rates else False,
-        return_rounds=False
+        return_rounds=False,
+        # PHASE 6: New exit controls
+        take_profit_pct=best_params.get('take_profit_pct'),
+        stop_loss_pct=best_params.get('stop_loss_pct'),
+        breakeven_after_pct=best_params.get('breakeven_after_pct'),
+        # PHASE 6: New timing controls
+        pyramid_cooldown_sec=best_params.get('pyramid_cooldown_sec', 0),
+        max_round_duration_hr=best_params.get('max_round_duration_hr'),
+        # PHASE 6: New filters
+        trend_filter_ema=best_params.get('trend_filter_ema'),
+        session_filter=best_params.get('session_filter', 'all'),
     )
 
     if verbose:
@@ -649,7 +701,17 @@ def validate_regime_robustness(
         use_margin_tracking=USE_MARGIN_TRACKING,
         funding_rates=funding_rates,
         apply_funding=APPLY_FUNDING_RATES if funding_rates else False,
-        return_rounds=True  # Need rounds for regime mapping
+        return_rounds=True,  # Need rounds for regime mapping
+        # PHASE 6: New exit controls
+        take_profit_pct=best_params.get('take_profit_pct'),
+        stop_loss_pct=best_params.get('stop_loss_pct'),
+        breakeven_after_pct=best_params.get('breakeven_after_pct'),
+        # PHASE 6: New timing controls
+        pyramid_cooldown_sec=best_params.get('pyramid_cooldown_sec', 0),
+        max_round_duration_hr=best_params.get('max_round_duration_hr'),
+        # PHASE 6: New filters
+        trend_filter_ema=best_params.get('trend_filter_ema'),
+        session_filter=best_params.get('session_filter', 'all'),
     )
 
     rounds = result_with_rounds.get('rounds', [])
@@ -946,7 +1008,17 @@ def run_streaming_grid_search(
                     use_margin_tracking=USE_MARGIN_TRACKING,
                     funding_rates=funding_rates,
                     apply_funding=APPLY_FUNDING_RATES if funding_rates else False,
-                    return_rounds=False  # MEMORY OPTIMIZATION: Skip round accumulation
+                    return_rounds=False,  # MEMORY OPTIMIZATION: Skip round accumulation
+                    # PHASE 6: New exit controls
+                    take_profit_pct=full_params.get('take_profit_pct'),
+                    stop_loss_pct=full_params.get('stop_loss_pct'),
+                    breakeven_after_pct=full_params.get('breakeven_after_pct'),
+                    # PHASE 6: New timing controls
+                    pyramid_cooldown_sec=full_params.get('pyramid_cooldown_sec', 0),
+                    max_round_duration_hr=full_params.get('max_round_duration_hr'),
+                    # PHASE 6: New filters
+                    trend_filter_ema=full_params.get('trend_filter_ema'),
+                    session_filter=full_params.get('session_filter', 'all'),
                 )
 
                 # Format for storage
@@ -966,12 +1038,22 @@ def run_streaming_grid_search(
                     'vol_type': full_params.get('vol_type', 'none'),
                     'vol_min': full_params.get('vol_min', 0.0),
                     'vol_window': full_params.get('vol_window', 100),
+                    'confirmation_ticks': full_params.get('confirmation_ticks', 3),
+                    # PHASE 6: New parameters
+                    'take_profit_pct': full_params.get('take_profit_pct'),
+                    'stop_loss_pct': full_params.get('stop_loss_pct'),
+                    'breakeven_after_pct': full_params.get('breakeven_after_pct'),
+                    'pyramid_cooldown_sec': full_params.get('pyramid_cooldown_sec', 0),
+                    'max_round_duration_hr': full_params.get('max_round_duration_hr'),
+                    'trend_filter_ema': full_params.get('trend_filter_ema'),
+                    'session_filter': full_params.get('session_filter', 'all'),
+                    # Results
                     'total_pnl': result['total_pnl'],
                     'rounds': result['total_rounds'],
                     'avg_pnl': result['avg_pnl'],
                     'win_rate': result['win_rate'],
                     'avg_pyramids': result['avg_pyramids'],
-                    'max_drawdown_pct': result.get('max_drawdown_pct', 0)  # PHASE 6: Risk metric
+                    'max_drawdown_pct': result.get('max_drawdown_pct', 0)  # Risk metric
                 }
 
                 # Write to disk immediately
@@ -1062,7 +1144,17 @@ def run_single_backtest_streaming(
         use_margin_tracking=USE_MARGIN_TRACKING,
         funding_rates=funding_rates,
         apply_funding=APPLY_FUNDING_RATES if funding_rates else False,
-        return_rounds=False  # MEMORY OPTIMIZATION: Skip round accumulation
+        return_rounds=False,  # MEMORY OPTIMIZATION: Skip round accumulation
+        # PHASE 6: New exit controls
+        take_profit_pct=params.get('take_profit_pct'),
+        stop_loss_pct=params.get('stop_loss_pct'),
+        breakeven_after_pct=params.get('breakeven_after_pct'),
+        # PHASE 6: New timing controls
+        pyramid_cooldown_sec=params.get('pyramid_cooldown_sec', 0),
+        max_round_duration_hr=params.get('max_round_duration_hr'),
+        # PHASE 6: New filters
+        trend_filter_ema=params.get('trend_filter_ema'),
+        session_filter=params.get('session_filter', 'all'),
     )
 
     return result
