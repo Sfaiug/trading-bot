@@ -278,18 +278,13 @@ def passes_risk_constraints(result: Dict) -> Tuple[bool, List[str]]:
 
 def load_tick_data(symbol: str, days: int, cache_dir: str = "./cache/trades") -> Tuple[List, Dict]:
     """Load tick data for backtesting."""
-    from data.tick_data_fetcher import load_cached_ticks, fetch_and_cache_ticks
+    from data.tick_data_fetcher import fetch_tick_data
 
-    cache_file = os.path.join(cache_dir, f"{symbol}_trades.pkl")
+    # Convert days to years (fetch_tick_data uses years)
+    years = max(1, days // 365)
 
-    if os.path.exists(cache_file):
-        print(f"Loading cached tick data from {cache_file}...")
-        ticks = load_cached_ticks(cache_file)
-    else:
-        print(f"Fetching tick data for {symbol}...")
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=days)
-        ticks = fetch_and_cache_ticks(symbol, start_date, end_date, cache_file)
+    print(f"Loading tick data for {symbol} ({years} years)...")
+    ticks = fetch_tick_data(symbol, years=years, aggregate_seconds=1.0, verbose=True)
 
     # Data quality validation (from v4)
     if VALIDATE_DATA_QUALITY and len(ticks) > 0:
