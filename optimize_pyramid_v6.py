@@ -1351,14 +1351,53 @@ def save_results(results: List[OptimizationResult], output_dir: str, symbol: str
 # CLI ENTRY POINT
 # =============================================================================
 
+# Available coins for optimization
+AVAILABLE_COINS = [
+    ("BTC", "BTCUSDT", "Bitcoin"),
+    ("ETH", "ETHUSDT", "Ethereum"),
+    ("SOL", "SOLUSDT", "Solana"),
+    ("XRP", "XRPUSDT", "Ripple"),
+    ("DOGE", "DOGEUSDT", "Dogecoin"),
+    ("XLM", "XLMUSDT", "Stellar"),
+]
+
+
+def select_coin_interactive() -> str:
+    """Display interactive coin selection menu."""
+    print()
+    print("=" * 50)
+    print("SELECT COIN FOR OPTIMIZATION")
+    print("=" * 50)
+    print()
+    for i, (short, symbol, name) in enumerate(AVAILABLE_COINS, 1):
+        print(f"  {i}. {short:5} - {name} ({symbol})")
+    print()
+
+    while True:
+        try:
+            choice = input("Enter choice (1-6): ").strip()
+            idx = int(choice) - 1
+            if 0 <= idx < len(AVAILABLE_COINS):
+                selected = AVAILABLE_COINS[idx]
+                print(f"\nSelected: {selected[2]} ({selected[1]})")
+                return selected[1]
+            else:
+                print("Invalid choice. Please enter 1-6.")
+        except ValueError:
+            print("Invalid input. Please enter a number 1-6.")
+        except KeyboardInterrupt:
+            print("\nCancelled.")
+            sys.exit(0)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Trend-Following Pyramid Strategy Optimizer v6"
     )
     parser.add_argument(
         "--symbol", "-s",
-        default=DEFAULT_SYMBOL,
-        help=f"Trading pair symbol (default: {DEFAULT_SYMBOL})"
+        default=None,
+        help="Trading pair symbol (e.g., BTCUSDT). If not provided, shows interactive menu."
     )
     parser.add_argument(
         "--days", "-d",
@@ -1384,6 +1423,10 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # Interactive coin selection if no symbol provided
+    if args.symbol is None:
+        args.symbol = select_coin_interactive()
 
     results = run_optimization(
         symbol=args.symbol,
