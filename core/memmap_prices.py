@@ -71,8 +71,14 @@ def ensure_prices_on_disk(
         with open(meta_file, 'r') as f:
             meta = json.load(f)
         if verbose:
+            print(f"\n  [CACHE HIT] Found existing data for {symbol}")
             print(f"  Using cached data: {meta['total_prices']:,} prices ({meta['file_size_mb']:.1f} MB)")
+            print(f"  Cache file: {prices_file}")
         return prices_file, meta
+
+    if verbose:
+        print(f"\n  [CACHE MISS] No cached data for {symbol} ({years}yr)")
+        print(f"  Will download to: {prices_file}")
 
     if verbose:
         print(f"\n{'='*60}")
