@@ -70,10 +70,19 @@ def fetch_funding_rate_history_api(
 
         payments = []
         for item in data:
+            # Handle empty or invalid funding rates
+            funding_rate_str = item.get("fundingRate", "0")
+            if funding_rate_str == "" or funding_rate_str is None:
+                funding_rate_str = "0"
+
+            mark_price_str = item.get("markPrice", "0")
+            if mark_price_str == "" or mark_price_str is None:
+                mark_price_str = "0"
+
             payment = FundingPayment(
                 timestamp=datetime.fromtimestamp(item["fundingTime"] / 1000),
-                funding_rate=float(item["fundingRate"]) * 100,  # Convert to percentage
-                mark_price=float(item.get("markPrice", 0))
+                funding_rate=float(funding_rate_str) * 100,  # Convert to percentage
+                mark_price=float(mark_price_str)
             )
             payments.append(payment)
 

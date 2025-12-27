@@ -597,9 +597,15 @@ def run_optimization(
     failed_gate = 0
     not_significant = 0
 
-    # Process all combinations
+    # Process all combinations with real-time progress
     print(f"Processing {n_combos:,} combinations...")
     print("-" * 70)
+
+    # Timing for progress estimation
+    import time as time_module
+    start_time = time_module.time()
+    last_update_time = start_time
+    combo_times = []  # Track time per combo for ETA
 
     for batch_start in range(0, n_combos, batch_size):
         batch_end = min(batch_start + batch_size, n_combos)
@@ -607,13 +613,30 @@ def run_optimization(
 
         for i, params in enumerate(batch):
             combo_idx = batch_start + i + 1
+            combo_start = time_module.time()
 
-            if verbose and combo_idx % 50 == 0:
+            # Real-time progress bar (update every combo)
+            if verbose:
+                elapsed = time_module.time() - start_time
+                elapsed_str = f"{int(elapsed//60)}m{int(elapsed%60):02d}s"
+
+                # Calculate ETA from average combo time
+                if combo_times:
+                    avg_time = sum(combo_times[-20:]) / len(combo_times[-20:])  # Last 20 combos
+                    remaining = (n_combos - combo_idx) * avg_time
+                    eta_str = f"{int(remaining//60)}m{int(remaining%60):02d}s"
+                else:
+                    eta_str = "calculating..."
+
                 pct = combo_idx / n_combos * 100
-                print(f"[{combo_idx:,}/{n_combos:,}] {pct:.1f}% | "
-                      f"Passed: {len(passed_combos)} | "
-                      f"Failed gate: {failed_gate} | "
-                      f"Not significant: {not_significant}")
+                bar_len = 30
+                filled = int(bar_len * combo_idx / n_combos)
+                bar = "█" * filled + "░" * (bar_len - filled)
+
+                print(f"\r[{bar}] {pct:5.1f}% | {combo_idx}/{n_combos} | "
+                      f"Elapsed: {elapsed_str} | ETA: {eta_str} | "
+                      f"Pass: {len(passed_combos)} | Fail: {failed_gate}",
+                      end="", flush=True)
 
             # Test on FOLD 0 first
             fold = folds[0]
@@ -652,6 +675,9 @@ def run_optimization(
             if not gate_passed:
                 failed_gate += 1
                 csv_writer.writerow(csv_row)
+                # Track combo time even for failed combos
+                combo_time = time_module.time() - combo_start
+                combo_times.append(combo_time)
                 continue
 
             # BONFERRONI SIGNIFICANCE CHECK
@@ -666,6 +692,9 @@ def run_optimization(
 
             if not is_significant:
                 not_significant += 1
+                # Track combo time even for non-significant combos
+                combo_time = time_module.time() - combo_start
+                combo_times.append(combo_time)
                 continue
 
             # Validate total P&L positive across folds
@@ -722,6 +751,10 @@ def run_optimization(
                 avg_val_pnl=avg_val_pnl,
             )
             passed_combos.append(result)
+
+            # Track combo time for ETA calculation
+            combo_time = time_module.time() - combo_start
+            combo_times.append(combo_time)
 
         # Memory management
         gc.collect()

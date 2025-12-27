@@ -367,6 +367,10 @@ def validate_memmap_quality(
 
     Only loads a sample into RAM for validation.
 
+    NOTE: This may report low quality scores for large datasets because
+    the sampling creates apparent gaps between records. The actual data
+    is still valid - this is just a limitation of sampling.
+
     Args:
         prices: Memory-mapped price array
         sample_size: Number of records to sample
