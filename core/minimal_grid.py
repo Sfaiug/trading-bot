@@ -188,12 +188,17 @@ def get_bonferroni_alpha(grid: Dict[str, List] = None, family_alpha: float = 0.0
 
 def get_fixed_folds(total_days: int = 1825) -> Tuple[List[Dict], Dict]:
     """
-    Get fixed-size fold structure with gaps to prevent look-ahead bias.
+    Get NON-OVERLAPPING fold structure with gaps to prevent look-ahead bias.
 
-    - Fold 0: Train 0%-30%, Val 35%-45% (5% gap)
-    - Fold 1: Train 20%-50%, Val 55%-65% (5% gap)
-    - Fold 2: Train 40%-70%, Val 75%-85% (5% gap)
-    - Holdout: 90%-100%
+    v7.1 FIX: Folds no longer overlap - each training set is independent.
+    This ensures proper cross-validation (correlated results from overlapping
+    training data was a major statistical flaw in v7.0).
+
+    Structure (with 2% gaps between train and val):
+    - Fold 0: Train 0%-20%, Gap 20%-22%, Val 22%-32%
+    - Fold 1: Train 32%-52%, Gap 52%-54%, Val 54%-64%
+    - Fold 2: Train 64%-76%, Gap 76%-78%, Val 78%-85%
+    - Holdout: 85%-100% (15% = ~9 months for 5 years)
 
     Args:
         total_days: Total days in dataset (default 1825 = 5 years)
@@ -204,23 +209,23 @@ def get_fixed_folds(total_days: int = 1825) -> Tuple[List[Dict], Dict]:
     folds = [
         {
             'name': 'Fold 0',
-            'train_start_pct': 0.0,
-            'train_end_pct': 0.30,
-            'val_start_pct': 0.35,
-            'val_end_pct': 0.45,
+            'train_start_pct': 0.00,
+            'train_end_pct': 0.20,
+            'val_start_pct': 0.22,  # 2% gap
+            'val_end_pct': 0.32,
         },
         {
             'name': 'Fold 1',
-            'train_start_pct': 0.20,
-            'train_end_pct': 0.50,
-            'val_start_pct': 0.55,
-            'val_end_pct': 0.65,
+            'train_start_pct': 0.32,
+            'train_end_pct': 0.52,
+            'val_start_pct': 0.54,  # 2% gap
+            'val_end_pct': 0.64,
         },
         {
             'name': 'Fold 2',
-            'train_start_pct': 0.40,
-            'train_end_pct': 0.70,
-            'val_start_pct': 0.75,
+            'train_start_pct': 0.64,
+            'train_end_pct': 0.76,
+            'val_start_pct': 0.78,  # 2% gap
             'val_end_pct': 0.85,
         },
     ]
@@ -232,12 +237,13 @@ def get_fixed_folds(total_days: int = 1825) -> Tuple[List[Dict], Dict]:
         fold['val_start'] = int(total_days * fold['val_start_pct'])
         fold['val_end'] = int(total_days * fold['val_end_pct'])
 
-    # Holdout is always 90%-100%
+    # Holdout is 85%-100% (15% = ~9 months for 5 years)
+    # v7.1 FIX: Increased from 10% to 15% for better statistical confidence
     holdout = {
         'name': 'Holdout',
-        'start_pct': 0.90,
+        'start_pct': 0.85,
         'end_pct': 1.00,
-        'start': int(total_days * 0.90),
+        'start': int(total_days * 0.85),
         'end': total_days,
     }
 

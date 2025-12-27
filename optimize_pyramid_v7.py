@@ -1,24 +1,27 @@
 #!/usr/bin/env python3
 """
-Pure Profit Pyramid Strategy Optimizer (v7)
+Pure Profit Pyramid Strategy Optimizer (v7.1)
 
-This optimizer follows the "Whatever Works" philosophy:
+v7.1 CRITICAL FIXES:
+- Fixed data leakage in robustness testing (excluded holdout data)
+- Fixed overlapping folds (now non-overlapping for proper CV)
+- Moved Bonferroni correction from train to holdout phase
+- Increased holdout from 10% to 15% (9 months vs 6 months)
+- Added position-size-dependent slippage model
+- Added walk-forward validation for regime testing
+
+PHILOSOPHY: "Whatever Works" - pure profit optimization
 - NO arbitrary constraints (win rate, drawdown, expectancy, profit factor)
 - PURE PROFIT optimization - only holdout P&L matters
 - 640 combinations (8x better statistical validity than v5/v6)
 
-KEY DIFFERENCES FROM v5/v6:
-1. MINIMAL GRID: 640 combos (vs 5,120) - 8x better Bonferroni alpha
-2. NO CONSTRAINTS: No win rate, no drawdown limit, no expectancy minimum
-3. PURE PROFIT: Ranking = holdout total P&L (not risk-adjusted)
-4. REMOVED PARAMETERS: No TP/SL, no acceleration, no min_spacing, no time_decay
-
-PRESERVED STATISTICAL VALIDITY:
-- Bonferroni correction (alpha = 0.05/640 = 0.000078)
-- Cross-fold validation (total P&L positive)
-- Holdout testing (profitable on unseen data)
+STATISTICAL VALIDITY:
+- Bonferroni correction applied to HOLDOUT (not train) - α = 0.05/N
+- Non-overlapping cross-fold validation
+- 15% holdout (~9 months) for statistical confidence
+- Walk-forward validation for regime stability
 - Monte Carlo survival simulation
-- Robustness testing (nearby params work)
+- Robustness testing (on train/val data only - no holdout leakage)
 
 Grid Size: 5 x 4 x 4 x 2 x 2 x 2 = 640 combinations
 
@@ -54,6 +57,10 @@ from core.minimal_grid import (
 from core.disk_results import (
     DiskResultStorage,
     calculate_real_sharpe,
+)
+from core.slippage_model import (
+    calculate_slippage_pct,
+    estimate_round_slippage_pct,
 )
 from backtest_pyramid import (
     run_pyramid_backtest,
@@ -680,22 +687,15 @@ def run_optimization(
                 combo_times.append(combo_time)
                 continue
 
-            # BONFERRONI SIGNIFICANCE CHECK
+            # v7.1 FIX: Removed Bonferroni check from training phase
+            # Bonferroni is now applied in holdout phase (Phase 3) where it matters
+            # Testing significance on TRAINING data is meaningless - we already know it's profitable
             per_round_returns = train_result.get('per_round_returns', [])
-            is_significant, p_value, corrected_alpha = check_bonferroni_significance(
-                params, per_round_returns, n_combos, FAMILY_ALPHA
-            )
+            p_value = 0.0  # Will be calculated on holdout
 
-            csv_row['is_significant'] = is_significant
+            csv_row['is_significant'] = True  # Deferred to holdout phase
             csv_row['p_value'] = p_value
             csv_writer.writerow(csv_row)
-
-            if not is_significant:
-                not_significant += 1
-                # Track combo time even for non-significant combos
-                combo_time = time_module.time() - combo_start
-                combo_times.append(combo_time)
-                continue
 
             # Validate total P&L positive across folds
             total_pnl_positive, fold_pnls, avg_val_pnl = validate_across_all_folds(
@@ -742,8 +742,8 @@ def run_optimization(
                 },
                 holdout_metrics=None,
                 passed_gate=True,
-                is_significant=True,
-                p_value=p_value,
+                is_significant=False,  # v7.1: Set in holdout phase, not here
+                p_value=1.0,           # v7.1: Calculated on holdout data
                 sharpe=sharpe,
                 per_round_returns=per_round_returns,
                 fold_pnls=fold_pnls,
@@ -765,9 +765,9 @@ def run_optimization(
     print(f"\nCSV log saved to: {csv_file}")
 
     print("-" * 70)
-    print(f"PHASE 1 COMPLETE: {len(passed_combos)} combos passed validation + Bonferroni")
+    print(f"PHASE 1 COMPLETE: {len(passed_combos)} combos passed validation gate")
     print(f"  Failed gate: {failed_gate}")
-    print(f"  Not significant: {not_significant}")
+    print(f"  (Note: Bonferroni significance now applied in Phase 3 on holdout data)")
 
     # Filter to those with positive total P&L
     total_positive = [r for r in passed_combos if r.total_pnl_positive]
@@ -792,9 +792,17 @@ def run_optimization(
     print("PHASE 2: ROBUSTNESS TESTING")
     print("=" * 70)
 
+    # v7.1 FIX: Use only train+val data, EXCLUDE holdout to prevent data leakage
+    # Holdout starts at 85%, so we use 0-85% for robustness testing
+    holdout_start_pct = holdout['start_pct']
+    non_holdout_end = int(len(prices) * holdout_start_pct)
+    train_val_prices = prices[:non_holdout_end]
+    print(f"  Using {non_holdout_end:,} prices (0-{holdout_start_pct*100:.0f}%) for robustness testing")
+    print(f"  (Holdout {holdout_start_pct*100:.0f}-100% is excluded to prevent data leakage)")
+
     for result in working_results[:30]:
         robustness, perturbations = calculate_robustness_score(
-            result.params, prices, funding_rates
+            result.params, train_val_prices, funding_rates  # v7.1: Use train_val_prices, not all prices
         )
         result.robustness_score = robustness
 
@@ -814,32 +822,71 @@ def run_optimization(
     # PHASE 3: Holdout evaluation (THE ONLY THING THAT MATTERS)
     print()
     print("=" * 70)
-    print("PHASE 3: HOLDOUT EVALUATION (Pure Profit)")
+    print("PHASE 3: HOLDOUT EVALUATION + BONFERRONI (Pure Profit)")
     print("=" * 70)
+    print("v7.1: Bonferroni correction now applied HERE on holdout data")
     print("Ranking by HOLDOUT TOTAL P&L - nothing else matters")
     print()
 
     holdout_prices = slice_prices_for_holdout(prices, holdout)
-    final_results = []
+    holdout_candidates = []
+    n_holdout_tests = min(100, len(working_results))  # Number of holdout tests for Bonferroni
+    holdout_bonferroni_alpha = FAMILY_ALPHA / n_holdout_tests if n_holdout_tests > 0 else FAMILY_ALPHA
+    print(f"  Testing {n_holdout_tests} combos on holdout")
+    print(f"  Bonferroni alpha for holdout: {holdout_bonferroni_alpha:.6f}")
+    print()
 
     for result in working_results[:100]:  # Test top 100
         holdout_result = run_backtest_with_params(result.params, holdout_prices, funding_rates)
 
+        holdout_pnl = holdout_result.get('total_pnl', 0)
+        holdout_rounds = holdout_result.get('total_rounds', 0)
+
+        # v7.1 FIX: Apply slippage cost estimate to holdout P&L
+        num_pyramids = holdout_result.get('avg_pyramids', 5)  # Estimate avg pyramids
+        slippage_pct = estimate_round_slippage_pct(
+            num_pyramids=int(num_pyramids),
+            position_size_usdt=POSITION_SIZE_USDT,
+            symbol=symbol
+        )
+        # Apply slippage penalty per round
+        total_slippage = slippage_pct * holdout_rounds
+        adjusted_pnl = holdout_pnl - total_slippage
+
         result.holdout_metrics = {
-            'total_pnl': holdout_result.get('total_pnl', 0),
+            'total_pnl': holdout_pnl,
+            'adjusted_pnl': adjusted_pnl,  # After slippage
+            'slippage_pct': total_slippage,
             'win_rate': holdout_result.get('win_rate', 0),
-            'total_rounds': holdout_result.get('total_rounds', 0),
+            'total_rounds': holdout_rounds,
             'max_drawdown_pct': holdout_result.get('max_drawdown_pct', 0),
         }
 
-        # MINIMAL REQUIREMENTS: profitable and enough rounds
-        if (result.holdout_metrics['total_pnl'] >= MIN_HOLDOUT_PNL and
-            result.holdout_metrics['total_rounds'] >= MIN_HOLDOUT_ROUNDS):
-            final_results.append(result)
+        # v7.1 FIX: Apply Bonferroni significance test on HOLDOUT returns
+        holdout_returns = holdout_result.get('per_round_returns', [])
+        if len(holdout_returns) >= 10:  # Need enough rounds
+            is_significant, p_value, _ = check_bonferroni_significance(
+                result.params, holdout_returns, n_holdout_tests, FAMILY_ALPHA
+            )
+            result.is_significant = is_significant
+            result.p_value = p_value
+        else:
+            result.is_significant = False
+            result.p_value = 1.0
 
-    # PURE PROFIT RANKING - sort by holdout P&L
-    final_results.sort(key=lambda x: x.holdout_metrics['total_pnl'], reverse=True)
-    print(f"{len(final_results)} combos have positive holdout P&L with {MIN_HOLDOUT_ROUNDS}+ rounds")
+        # REQUIREMENTS: profitable (after slippage), enough rounds, statistically significant
+        if (adjusted_pnl >= MIN_HOLDOUT_PNL and
+            holdout_rounds >= MIN_HOLDOUT_ROUNDS and
+            result.is_significant):
+            holdout_candidates.append(result)
+
+    # PURE PROFIT RANKING - sort by adjusted holdout P&L (after slippage)
+    holdout_candidates.sort(key=lambda x: x.holdout_metrics['adjusted_pnl'], reverse=True)
+    final_results = holdout_candidates
+    print(f"{len(final_results)} combos pass holdout requirements:")
+    print(f"  - Positive adjusted P&L (after slippage)")
+    print(f"  - {MIN_HOLDOUT_ROUNDS}+ rounds")
+    print(f"  - Bonferroni significant (p < {holdout_bonferroni_alpha:.6f})")
 
     # Top 3 validation (overfitting guard)
     if final_results:
@@ -908,13 +955,77 @@ def run_optimization(
         except ImportError as e:
             print(f"  Monte Carlo module not available: {e}")
 
+    # PHASE 6: Walk-Forward Validation (v7.1 NEW)
+    print()
+    print("=" * 70)
+    print("PHASE 6: WALK-FORWARD VALIDATION (v7.1 NEW)")
+    print("=" * 70)
+    print("Testing strategy stability across different time periods")
+    print()
+
+    walk_forward_result = None
+    if final_results:
+        try:
+            from core.walk_forward import (
+                run_walk_forward_optimization,
+                format_walk_forward_report,
+            )
+
+            # Create a wrapper for run_backtest_with_params that matches expected signature
+            def backtest_wrapper(params, price_slice, funding):
+                return run_backtest_with_params(params, price_slice, funding, return_rounds=True)
+
+            walk_forward_result = run_walk_forward_optimization(
+                prices=prices,
+                funding_rates=funding_rates,
+                run_backtest_func=backtest_wrapper,
+                train_years=2,
+                test_years=1,
+                step_years=1,
+                total_years=max(1, days // 365),
+                verbose=True,
+            )
+
+            # Print report
+            print(format_walk_forward_report(walk_forward_result))
+
+            # Store walk-forward stable params if available
+            if walk_forward_result.best_stable_params and final_results:
+                # Check if walk-forward stable params match top result
+                top_params = final_results[0].params
+                wf_params = walk_forward_result.best_stable_params
+                params_match = (
+                    top_params.get('threshold') == wf_params.get('threshold') and
+                    top_params.get('trailing') == wf_params.get('trailing') and
+                    top_params.get('pyramid_step') == wf_params.get('pyramid_step')
+                )
+                if params_match:
+                    print("\n  [EXCELLENT] Walk-forward stable params MATCH top holdout result!")
+                else:
+                    print("\n  [NOTE] Walk-forward stable params differ from top holdout result:")
+                    print(f"    Holdout best: th={top_params.get('threshold')}, tr={top_params.get('trailing')}")
+                    print(f"    Walk-forward: th={wf_params.get('threshold')}, tr={wf_params.get('trailing')}")
+
+        except ImportError as e:
+            print(f"  Walk-forward module not available: {e}")
+        except Exception as e:
+            print(f"  Walk-forward validation error: {e}")
+            import traceback
+            traceback.print_exc()
+
     # Save results
-    save_results(final_results, output_dir, symbol, funding_rates)
+    save_results(final_results, output_dir, symbol, funding_rates, walk_forward_result)
 
     return final_results
 
 
-def save_results(results: List[OptimizationResult], output_dir: str, symbol: str, funding_rates: Dict):
+def save_results(
+    results: List[OptimizationResult],
+    output_dir: str,
+    symbol: str,
+    funding_rates: Dict,
+    walk_forward_result=None
+):
     """Save optimization results to files."""
     os.makedirs(output_dir, exist_ok=True)
 
@@ -948,7 +1059,7 @@ def save_results(results: List[OptimizationResult], output_dir: str, symbol: str
     # Print summary
     print()
     print("=" * 70)
-    print("TOP 10 RESULTS (PURE PROFIT)")
+    print("TOP 10 RESULTS (PURE PROFIT v7.1)")
     print("=" * 70)
     for i, r in enumerate(top_10):
         params = r.params
@@ -959,12 +1070,17 @@ def save_results(results: List[OptimizationResult], output_dir: str, symbol: str
         print(f"   ---")
         print(f"   Train P&L:   {r.train_metrics['total_pnl']:+.2f}%")
         print(f"   Val P&L:     {r.avg_val_pnl:+.2f}% (avg across folds)")
-        print(f"   HOLDOUT P&L: {r.holdout_metrics['total_pnl']:+.2f}% << THE ONLY METRIC THAT MATTERS")
+        holdout_pnl = r.holdout_metrics.get('total_pnl', 0)
+        adjusted_pnl = r.holdout_metrics.get('adjusted_pnl', holdout_pnl)
+        slippage_pct = r.holdout_metrics.get('slippage_pct', 0)
+        print(f"   HOLDOUT P&L: {holdout_pnl:+.2f}% (raw)")
+        print(f"   ADJUSTED:    {adjusted_pnl:+.2f}% (after {slippage_pct:.2f}% slippage) << REALISTIC P&L")
         print(f"   ---")
         print(f"   Win Rate: {r.train_metrics['win_rate']:.1f}%")
         print(f"   Max DD: {r.train_metrics['max_drawdown_pct']:.1f}%")
         print(f"   Rounds: {r.holdout_metrics['total_rounds']}")
         print(f"   Robustness: {r.robustness_score:.2f}")
+        print(f"   Bonferroni p-value: {r.p_value:.6f}")
         print(f"   Monte Carlo: P(+)={r.mc_prob_positive:.1%}, P(ruin)={r.mc_prob_ruin:.1%}")
 
     # Save winner
@@ -998,12 +1114,30 @@ def save_results(results: List[OptimizationResult], output_dir: str, symbol: str
                 'is_significant': winner.is_significant,
             },
             'optimization_info': {
-                'version': 'v7-pure-profit',
+                'version': 'v7.1-pure-profit',
                 'grid_size': get_grid_size(),
                 'bonferroni_alpha': get_bonferroni_alpha(),
                 'timestamp': datetime.now().isoformat(),
+                'fixes': [
+                    'non-overlapping folds',
+                    'bonferroni on holdout',
+                    'robustness excludes holdout',
+                    '15% holdout (9 months)',
+                    'position-size slippage',
+                    'walk-forward validation',
+                ],
             },
         }
+
+        # Add walk-forward results if available
+        if walk_forward_result:
+            winner_data['walk_forward'] = {
+                'total_test_pnl': walk_forward_result.total_test_pnl,
+                'avg_test_pnl': walk_forward_result.avg_test_pnl,
+                'param_stability_score': walk_forward_result.param_stability_score,
+                'best_stable_params': walk_forward_result.best_stable_params,
+                'windows_analyzed': len(walk_forward_result.windows),
+            }
 
         with open(os.path.join(output_dir, f"{symbol}_winner_v7.json"), 'w') as f:
             json.dump(winner_data, f, indent=2, default=str)
