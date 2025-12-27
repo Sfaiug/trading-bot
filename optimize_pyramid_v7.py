@@ -111,13 +111,67 @@ DEFAULT_BATCH_SIZE = 50
 NUM_FOLDS = 3
 LOG_DIR = "logs"
 
-# SAMPLING CONFIGURATION (v7.1 performance fix)
-# Higher sample rate = faster but less accurate
-# Recommended: 10 for grid search (10x speedup), 1 for final validation
-DEFAULT_SAMPLE_RATE = 10       # Use 10% of data by default
-GRID_SAMPLE_RATE = 10          # Use 10% for initial grid search
-CROSSFOLD_SAMPLE_RATE = 5      # Use 20% for cross-fold validation
-HOLDOUT_SAMPLE_RATE = 1        # Use 100% for final holdout (most important)
+# =============================================================================
+# THOROUGHNESS CONFIGURATION (v7.2 user-selectable analysis depth)
+# =============================================================================
+
+@dataclass
+class ThoroughnessConfig:
+    """Configuration for optimization thoroughness level."""
+    name: str
+    sample_rate: int            # Use every Nth price (1=all, 10=every 10th)
+    crossfold_divisor: int      # sample_rate // divisor for cross-fold
+    robustness_divisor: int     # sample_rate // divisor for robustness
+    holdout_sample_rate: int    # 1 = full data, higher = sampled
+    mc_bootstrap: int           # Monte Carlo bootstrap iterations
+    mc_permutation: int         # Monte Carlo permutation iterations
+    estimated_time: str         # Human-readable estimate
+
+
+THOROUGHNESS_CONFIGS = {
+    'quick': ThoroughnessConfig(
+        name='Quick',
+        sample_rate=100,
+        crossfold_divisor=2,
+        robustness_divisor=2,
+        holdout_sample_rate=10,
+        mc_bootstrap=1000,
+        mc_permutation=500,
+        estimated_time='2-4 hours',
+    ),
+    'standard': ThoroughnessConfig(
+        name='Standard',
+        sample_rate=10,
+        crossfold_divisor=2,
+        robustness_divisor=2,
+        holdout_sample_rate=1,
+        mc_bootstrap=10000,
+        mc_permutation=5000,
+        estimated_time='6-12 hours',
+    ),
+    'thorough': ThoroughnessConfig(
+        name='Thorough',
+        sample_rate=5,
+        crossfold_divisor=1,
+        robustness_divisor=1,
+        holdout_sample_rate=1,
+        mc_bootstrap=20000,
+        mc_permutation=10000,
+        estimated_time='24-48 hours',
+    ),
+    'exhaustive': ThoroughnessConfig(
+        name='Exhaustive',
+        sample_rate=1,
+        crossfold_divisor=1,
+        robustness_divisor=1,
+        holdout_sample_rate=1,
+        mc_bootstrap=50000,
+        mc_permutation=25000,
+        estimated_time='27-54 days',
+    ),
+}
+
+DEFAULT_THOROUGHNESS = 'standard'
 
 # VALIDATION GATE (MINIMAL - only prevents garbage)
 MIN_VAL_PNL_RATIO = 0.3  # val_pnl >= 0.3 * train_pnl (loose overfitting check)
@@ -554,18 +608,25 @@ def run_optimization(
     output_dir: str = "./optimization_v7_results",
     batch_size: int = DEFAULT_BATCH_SIZE,
     verbose: bool = True,
-    sample_rate: int = DEFAULT_SAMPLE_RATE
+    thoroughness: ThoroughnessConfig = None
 ) -> List[OptimizationResult]:
     """
     Run pure profit optimized single-stage optimization.
     """
+    # Default to standard thoroughness if not specified
+    if thoroughness is None:
+        thoroughness = THOROUGHNESS_CONFIGS[DEFAULT_THOROUGHNESS]
+
     print("=" * 70)
-    print("PURE PROFIT OPTIMIZER v7 - 'Whatever Works'")
+    print("PURE PROFIT OPTIMIZER v7.2 - 'Whatever Works'")
     print("=" * 70)
     print(f"Symbol: {symbol}")
     print(f"Days: {days}")
+    print(f"Thoroughness: {thoroughness.name} (~{thoroughness.estimated_time})")
+    print(f"  - Grid sample rate: 1/{thoroughness.sample_rate} ({100/thoroughness.sample_rate:.0f}% data)")
+    print(f"  - Holdout sample rate: 1/{thoroughness.holdout_sample_rate} ({100/thoroughness.holdout_sample_rate:.0f}% data)")
+    print(f"  - Monte Carlo: {thoroughness.mc_bootstrap:,} bootstrap, {thoroughness.mc_permutation:,} permutation")
     print(f"Output: {output_dir}")
-    print(f"Sample rate: 1/{sample_rate} data ({100/sample_rate:.0f}%)")
     print(f"Started: {datetime.now()}")
     print()
     print("V7 PHILOSOPHY: No arbitrary constraints, just profit")
@@ -680,10 +741,10 @@ def run_optimization(
             train_prices, val_prices = slice_prices_for_fold(prices, fold)
 
             # Run training backtest (with sampling for speed)
-            train_result = run_backtest_with_params(params, train_prices, funding_rates, sample_rate=sample_rate)
+            train_result = run_backtest_with_params(params, train_prices, funding_rates, sample_rate=thoroughness.sample_rate)
 
             # MINIMAL VALIDATION GATE (just checks overfitting and round count)
-            val_result = run_backtest_with_params(params, val_prices, funding_rates, sample_rate=sample_rate)
+            val_result = run_backtest_with_params(params, val_prices, funding_rates, sample_rate=thoroughness.sample_rate)
 
             gate_passed, gate_reason = check_validation_gate(
                 train_result, val_result,
@@ -728,7 +789,7 @@ def run_optimization(
             csv_writer.writerow(csv_row)
 
             # Validate total P&L positive across folds (use crossfold sample rate for speed)
-            crossfold_rate = max(1, sample_rate // 2)  # Less aggressive sampling for cross-fold
+            crossfold_rate = max(1, thoroughness.sample_rate // thoroughness.crossfold_divisor)
             total_pnl_positive, fold_pnls, avg_val_pnl = validate_across_all_folds(
                 params, prices, folds, funding_rates, sample_rate=crossfold_rate
             )
@@ -832,7 +893,7 @@ def run_optimization(
     print(f"  (Holdout {holdout_start_pct*100:.0f}-100% is excluded to prevent data leakage)")
 
     # Use lighter sampling for robustness (fewer combos to test)
-    robustness_sample_rate = max(1, sample_rate // 2)
+    robustness_sample_rate = max(1, thoroughness.sample_rate // thoroughness.robustness_divisor)
     for result in working_results[:30]:
         robustness, perturbations = calculate_robustness_score(
             result.params, train_val_prices, funding_rates, sample_rate=robustness_sample_rate
@@ -867,12 +928,15 @@ def run_optimization(
     holdout_bonferroni_alpha = FAMILY_ALPHA / n_holdout_tests if n_holdout_tests > 0 else FAMILY_ALPHA
     print(f"  Testing {n_holdout_tests} combos on holdout")
     print(f"  Bonferroni alpha for holdout: {holdout_bonferroni_alpha:.6f}")
-    print(f"  Using FULL data (sample_rate=1) for final validation")
+    if thoroughness.holdout_sample_rate == 1:
+        print(f"  Using FULL data (sample_rate=1) for final validation")
+    else:
+        print(f"  Using 1/{thoroughness.holdout_sample_rate} data for holdout ({thoroughness.name} mode)")
     print()
 
     for result in working_results[:100]:  # Test top 100
-        # IMPORTANT: Use full data (sample_rate=1) for holdout - this is final validation
-        holdout_result = run_backtest_with_params(result.params, holdout_prices, funding_rates, sample_rate=1)
+        # Holdout validation - sample rate depends on thoroughness level
+        holdout_result = run_backtest_with_params(result.params, holdout_prices, funding_rates, sample_rate=thoroughness.holdout_sample_rate)
 
         holdout_pnl = holdout_result.get('total_pnl', 0)
         holdout_rounds = holdout_result.get('total_rounds', 0)
@@ -954,8 +1018,8 @@ def run_optimization(
 
             mc_validated = []
             for result in final_results[:30]:
-                # Use full data for Monte Carlo (sample_rate=1)
-                holdout_result = run_backtest_with_params(result.params, holdout_prices, funding_rates, sample_rate=1)
+                # Use holdout sample rate for Monte Carlo backtest
+                holdout_result = run_backtest_with_params(result.params, holdout_prices, funding_rates, sample_rate=thoroughness.holdout_sample_rate)
                 holdout_returns = holdout_result.get('per_round_returns', [])
 
                 if len(holdout_returns) < 10:
@@ -963,8 +1027,8 @@ def run_optimization(
 
                 passes, mc_result, perm_result = run_monte_carlo_validation(
                     round_returns=holdout_returns,
-                    n_bootstrap=10000,
-                    n_permutation=5000,
+                    n_bootstrap=thoroughness.mc_bootstrap,
+                    n_permutation=thoroughness.mc_permutation,
                     ruin_threshold=0.50,  # Generous - we don't limit drawdown
                     random_seed=42
                 )
@@ -1008,9 +1072,9 @@ def run_optimization(
             )
 
             # Create a wrapper for run_backtest_with_params that matches expected signature
-            # Use full data (sample_rate=1) for walk-forward validation
+            # Use holdout sample rate for walk-forward validation
             def backtest_wrapper(params, price_slice, funding):
-                return run_backtest_with_params(params, price_slice, funding, return_rounds=True, sample_rate=1)
+                return run_backtest_with_params(params, price_slice, funding, return_rounds=True, sample_rate=thoroughness.holdout_sample_rate)
 
             walk_forward_result = run_walk_forward_optimization(
                 prices=prices,
@@ -1295,11 +1359,18 @@ def main():
         help="Reduce output verbosity"
     )
     parser.add_argument(
+        "--thoroughness", "-t",
+        type=str,
+        choices=['quick', 'standard', 'thorough', 'exhaustive'],
+        default=DEFAULT_THOROUGHNESS,
+        help="Analysis thoroughness: quick (~2-4h), standard (~6-12h), "
+             "thorough (~24-48h), exhaustive (~27-54 days). Default: standard"
+    )
+    parser.add_argument(
         "--sample-rate", "-r",
         type=int,
-        default=DEFAULT_SAMPLE_RATE,
-        help=f"Sample rate for grid search (default: {DEFAULT_SAMPLE_RATE}). "
-             f"Use 10=10%% data (fast), 1=100%% data (slow but accurate)"
+        default=None,
+        help="(Advanced) Override sample rate. Use --thoroughness instead."
     )
 
     args = parser.parse_args()
@@ -1308,13 +1379,29 @@ def main():
     if args.symbol is None:
         args.symbol = select_coin_interactive()
 
+    # Resolve thoroughness config
+    if args.sample_rate is not None:
+        # Advanced user override - create custom config
+        thoroughness = ThoroughnessConfig(
+            name=f'Custom (sample_rate={args.sample_rate})',
+            sample_rate=args.sample_rate,
+            crossfold_divisor=2,
+            robustness_divisor=2,
+            holdout_sample_rate=1,
+            mc_bootstrap=10000,
+            mc_permutation=5000,
+            estimated_time='varies',
+        )
+    else:
+        thoroughness = THOROUGHNESS_CONFIGS[args.thoroughness]
+
     results = run_optimization(
         symbol=args.symbol,
         days=args.days,
         output_dir=args.output,
         batch_size=args.batch_size,
         verbose=not args.quiet,
-        sample_rate=args.sample_rate
+        thoroughness=thoroughness
     )
 
     print()
