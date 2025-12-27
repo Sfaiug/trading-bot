@@ -776,6 +776,9 @@ def run_optimization(
                 # Track combo time even for failed combos
                 combo_time = time_module.time() - combo_start
                 combo_times.append(combo_time)
+                # Prevent memory leak - keep only last 50 times for ETA
+                if len(combo_times) > 100:
+                    combo_times = combo_times[-50:]
                 continue
 
             # v7.1 FIX: Removed Bonferroni check from training phase
@@ -847,6 +850,9 @@ def run_optimization(
             # Track combo time for ETA calculation
             combo_time = time_module.time() - combo_start
             combo_times.append(combo_time)
+            # Prevent memory leak - keep only last 50 times for ETA
+            if len(combo_times) > 100:
+                combo_times = combo_times[-50:]
 
         # Memory management
         gc.collect()
