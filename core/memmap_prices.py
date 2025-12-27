@@ -188,22 +188,36 @@ def load_prices_memmap(prices_file: str, meta: Dict) -> np.memmap:
     return np.memmap(prices_file, dtype=RECORD_DTYPE, mode='r', shape=(total_prices,))
 
 
-def memmap_to_iterator(mmap_slice: np.ndarray) -> Iterator[Tuple[datetime, float]]:
+def memmap_to_iterator(
+    mmap_slice: np.ndarray,
+    sample_rate: int = 1
+) -> Iterator[Tuple[datetime, float]]:
     """
     Convert a memmap slice to a price iterator for backtesting.
 
-    Yields (datetime, price) tuples one at a time without loading
-    the full slice into RAM.
+    Yields (datetime, price) tuples. With sample_rate > 1, yields
+    only every Nth price for faster grid search.
 
     Args:
         mmap_slice: Slice of the memory-mapped price array
+        sample_rate: Use every Nth price (1=all, 10=every 10th, etc.)
+                    Higher values = faster but less accurate.
+                    Recommended: 10 for grid search, 1 for final validation.
 
     Yields:
-        Tuple of (datetime, float) for each price point
+        Tuple of (datetime, float) for each selected price point
     """
-    for record in mmap_slice:
-        ts = datetime.fromtimestamp(int(record['timestamp']))
-        yield (ts, float(record['price']))
+    if sample_rate <= 1:
+        # No sampling - iterate all prices
+        for record in mmap_slice:
+            ts = datetime.fromtimestamp(int(record['timestamp']))
+            yield (ts, float(record['price']))
+    else:
+        # Sample every Nth price for speed
+        for i in range(0, len(mmap_slice), sample_rate):
+            record = mmap_slice[i]
+            ts = datetime.fromtimestamp(int(record['timestamp']))
+            yield (ts, float(record['price']))
 
 
 def get_fold_indices(

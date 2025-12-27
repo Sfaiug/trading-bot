@@ -111,6 +111,14 @@ DEFAULT_BATCH_SIZE = 50
 NUM_FOLDS = 3
 LOG_DIR = "logs"
 
+# SAMPLING CONFIGURATION (v7.1 performance fix)
+# Higher sample rate = faster but less accurate
+# Recommended: 10 for grid search (10x speedup), 1 for final validation
+DEFAULT_SAMPLE_RATE = 10       # Use 10% of data by default
+GRID_SAMPLE_RATE = 10          # Use 10% for initial grid search
+CROSSFOLD_SAMPLE_RATE = 5      # Use 20% for cross-fold validation
+HOLDOUT_SAMPLE_RATE = 1        # Use 100% for final holdout (most important)
+
 # VALIDATION GATE (MINIMAL - only prevents garbage)
 MIN_VAL_PNL_RATIO = 0.3  # val_pnl >= 0.3 * train_pnl (loose overfitting check)
 MIN_VAL_ROUNDS = 15      # Minimum rounds for statistical validity
@@ -231,14 +239,23 @@ def slice_prices_for_holdout(prices, holdout: Dict):
     return slice_memmap_for_holdout(prices, holdout)
 
 
-def prices_to_iterator(price_slice):
-    """Convert a price slice to iterator for backtest."""
+def prices_to_iterator(price_slice, sample_rate: int = 1):
+    """Convert a price slice to iterator for backtest.
+
+    Args:
+        price_slice: Memory-mapped price array or list
+        sample_rate: Use every Nth price (1=all, 10=every 10th).
+                    Higher values = faster but less accurate.
+    """
     from core.memmap_prices import memmap_to_iterator
     import numpy as np
 
     if isinstance(price_slice, np.ndarray):
-        return memmap_to_iterator(price_slice)
+        return memmap_to_iterator(price_slice, sample_rate=sample_rate)
     else:
+        # For lists, apply sampling manually
+        if sample_rate > 1:
+            return iter(price_slice[::sample_rate])
         return iter(price_slice)
 
 
@@ -250,17 +267,26 @@ def run_backtest_with_params(
     params: Dict,
     price_slice,
     funding_rates: Dict = None,
-    return_rounds: bool = True
+    return_rounds: bool = True,
+    sample_rate: int = 1
 ) -> Dict:
     """
     Run backtest with expanded parameters.
+
+    Args:
+        params: Strategy parameters
+        price_slice: Memory-mapped price array or list
+        funding_rates: Funding rate dict
+        return_rounds: Include round details in result
+        sample_rate: Use every Nth price (1=all, 10=every 10th).
+                    For grid search use 10, for final validation use 1.
     """
     try:
         execution_model = DEFAULT_EXECUTION_MODEL
     except:
         execution_model = None
 
-    price_iter = prices_to_iterator(price_slice)
+    price_iter = prices_to_iterator(price_slice, sample_rate=sample_rate)
 
     result = run_pyramid_backtest(
         prices=price_iter,
@@ -315,12 +341,13 @@ def run_backtest_with_params(
 def calculate_robustness_score(
     params: Dict,
     prices,
-    funding_rates: Optional[Dict] = None
+    funding_rates: Optional[Dict] = None,
+    sample_rate: int = 1
 ) -> Tuple[float, List[Dict]]:
     """
     Test nearby parameters to check if the optimum is robust.
     """
-    center_result = run_backtest_with_params(params, prices, funding_rates, return_rounds=False)
+    center_result = run_backtest_with_params(params, prices, funding_rates, return_rounds=False, sample_rate=sample_rate)
     center_pnl = center_result['total_pnl']
 
     if center_pnl <= 0:
@@ -345,7 +372,7 @@ def calculate_robustness_score(
             limits = PARAM_LIMITS.get(param, (0, 100))
             if limits[0] <= new_val <= limits[1]:
                 perturbed[param] = new_val
-                result = run_backtest_with_params(perturbed, prices, funding_rates, return_rounds=False)
+                result = run_backtest_with_params(perturbed, prices, funding_rates, return_rounds=False, sample_rate=sample_rate)
                 perturbation_results.append({
                     'param': param,
                     'delta': delta,
@@ -370,7 +397,8 @@ def validate_across_all_folds(
     params: Dict,
     prices,
     folds: List[Dict],
-    funding_rates: Optional[Dict]
+    funding_rates: Optional[Dict],
+    sample_rate: int = 1
 ) -> Tuple[bool, List[float], float]:
     """
     Validate parameters across ALL folds.
@@ -382,7 +410,7 @@ def validate_across_all_folds(
 
     for fold in folds:
         train_prices, val_prices = slice_prices_for_fold(prices, fold)
-        val_result = run_backtest_with_params(params, val_prices, funding_rates, return_rounds=False)
+        val_result = run_backtest_with_params(params, val_prices, funding_rates, return_rounds=False, sample_rate=sample_rate)
         val_pnl = val_result.get('total_pnl', 0)
         fold_pnls.append(val_pnl)
 
@@ -525,7 +553,8 @@ def run_optimization(
     days: int = DEFAULT_DAYS,
     output_dir: str = "./optimization_v7_results",
     batch_size: int = DEFAULT_BATCH_SIZE,
-    verbose: bool = True
+    verbose: bool = True,
+    sample_rate: int = DEFAULT_SAMPLE_RATE
 ) -> List[OptimizationResult]:
     """
     Run pure profit optimized single-stage optimization.
@@ -536,6 +565,7 @@ def run_optimization(
     print(f"Symbol: {symbol}")
     print(f"Days: {days}")
     print(f"Output: {output_dir}")
+    print(f"Sample rate: 1/{sample_rate} data ({100/sample_rate:.0f}%)")
     print(f"Started: {datetime.now()}")
     print()
     print("V7 PHILOSOPHY: No arbitrary constraints, just profit")
@@ -649,11 +679,11 @@ def run_optimization(
             fold = folds[0]
             train_prices, val_prices = slice_prices_for_fold(prices, fold)
 
-            # Run training backtest
-            train_result = run_backtest_with_params(params, train_prices, funding_rates)
+            # Run training backtest (with sampling for speed)
+            train_result = run_backtest_with_params(params, train_prices, funding_rates, sample_rate=sample_rate)
 
             # MINIMAL VALIDATION GATE (just checks overfitting and round count)
-            val_result = run_backtest_with_params(params, val_prices, funding_rates)
+            val_result = run_backtest_with_params(params, val_prices, funding_rates, sample_rate=sample_rate)
 
             gate_passed, gate_reason = check_validation_gate(
                 train_result, val_result,
@@ -697,9 +727,10 @@ def run_optimization(
             csv_row['p_value'] = p_value
             csv_writer.writerow(csv_row)
 
-            # Validate total P&L positive across folds
+            # Validate total P&L positive across folds (use crossfold sample rate for speed)
+            crossfold_rate = max(1, sample_rate // 2)  # Less aggressive sampling for cross-fold
             total_pnl_positive, fold_pnls, avg_val_pnl = validate_across_all_folds(
-                params, prices, folds, funding_rates
+                params, prices, folds, funding_rates, sample_rate=crossfold_rate
             )
 
             # Save to storage
@@ -800,9 +831,11 @@ def run_optimization(
     print(f"  Using {non_holdout_end:,} prices (0-{holdout_start_pct*100:.0f}%) for robustness testing")
     print(f"  (Holdout {holdout_start_pct*100:.0f}-100% is excluded to prevent data leakage)")
 
+    # Use lighter sampling for robustness (fewer combos to test)
+    robustness_sample_rate = max(1, sample_rate // 2)
     for result in working_results[:30]:
         robustness, perturbations = calculate_robustness_score(
-            result.params, train_val_prices, funding_rates  # v7.1: Use train_val_prices, not all prices
+            result.params, train_val_prices, funding_rates, sample_rate=robustness_sample_rate
         )
         result.robustness_score = robustness
 
@@ -834,10 +867,12 @@ def run_optimization(
     holdout_bonferroni_alpha = FAMILY_ALPHA / n_holdout_tests if n_holdout_tests > 0 else FAMILY_ALPHA
     print(f"  Testing {n_holdout_tests} combos on holdout")
     print(f"  Bonferroni alpha for holdout: {holdout_bonferroni_alpha:.6f}")
+    print(f"  Using FULL data (sample_rate=1) for final validation")
     print()
 
     for result in working_results[:100]:  # Test top 100
-        holdout_result = run_backtest_with_params(result.params, holdout_prices, funding_rates)
+        # IMPORTANT: Use full data (sample_rate=1) for holdout - this is final validation
+        holdout_result = run_backtest_with_params(result.params, holdout_prices, funding_rates, sample_rate=1)
 
         holdout_pnl = holdout_result.get('total_pnl', 0)
         holdout_rounds = holdout_result.get('total_rounds', 0)
@@ -919,7 +954,8 @@ def run_optimization(
 
             mc_validated = []
             for result in final_results[:30]:
-                holdout_result = run_backtest_with_params(result.params, holdout_prices, funding_rates)
+                # Use full data for Monte Carlo (sample_rate=1)
+                holdout_result = run_backtest_with_params(result.params, holdout_prices, funding_rates, sample_rate=1)
                 holdout_returns = holdout_result.get('per_round_returns', [])
 
                 if len(holdout_returns) < 10:
@@ -972,8 +1008,9 @@ def run_optimization(
             )
 
             # Create a wrapper for run_backtest_with_params that matches expected signature
+            # Use full data (sample_rate=1) for walk-forward validation
             def backtest_wrapper(params, price_slice, funding):
-                return run_backtest_with_params(params, price_slice, funding, return_rounds=True)
+                return run_backtest_with_params(params, price_slice, funding, return_rounds=True, sample_rate=1)
 
             walk_forward_result = run_walk_forward_optimization(
                 prices=prices,
@@ -1257,6 +1294,13 @@ def main():
         action="store_true",
         help="Reduce output verbosity"
     )
+    parser.add_argument(
+        "--sample-rate", "-r",
+        type=int,
+        default=DEFAULT_SAMPLE_RATE,
+        help=f"Sample rate for grid search (default: {DEFAULT_SAMPLE_RATE}). "
+             f"Use 10=10%% data (fast), 1=100%% data (slow but accurate)"
+    )
 
     args = parser.parse_args()
 
@@ -1269,7 +1313,8 @@ def main():
         days=args.days,
         output_dir=args.output,
         batch_size=args.batch_size,
-        verbose=not args.quiet
+        verbose=not args.quiet,
+        sample_rate=args.sample_rate
     )
 
     print()
