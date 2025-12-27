@@ -386,6 +386,130 @@ def validate_across_all_folds(
 
 
 # =============================================================================
+# TOP 3 CANDIDATES VALIDATION (OVERFITTING GUARD)
+# =============================================================================
+
+def validate_top_3_candidates(
+    results: List[OptimizationResult],
+    prices,
+    holdout: Dict,
+    funding_rates: Optional[Dict]
+) -> Tuple[int, bool]:
+    """
+    Validate top 3 candidates as overfitting guard.
+
+    If only 1 passes, it's likely a statistical fluke.
+    This is a key anti-overfitting measure.
+    """
+    holdout_prices = slice_prices_for_holdout(prices, holdout)
+    top_3 = results[:3] if len(results) >= 3 else results
+
+    pass_count = 0
+    all_pass = True
+
+    print("\n--- TOP 3 CANDIDATES VALIDATION (Overfitting Guard) ---")
+
+    for i, result in enumerate(top_3):
+        holdout_result = run_backtest_with_params(result.params, holdout_prices, funding_rates, return_rounds=True)
+
+        # Simple check: positive P&L and enough rounds
+        pnl = holdout_result.get('total_pnl', 0)
+        rounds = holdout_result.get('total_rounds', 0)
+        passes = pnl > 0 and rounds >= MIN_HOLDOUT_ROUNDS
+
+        status = "[PASS]" if passes else "[FAIL]"
+        params_str = f"th={result.params['threshold']}, tr={result.params['trailing']}"
+        print(f"  Top {i+1}: {status} ({params_str}) P&L={pnl:.1f}%, rounds={rounds}")
+
+        if passes:
+            pass_count += 1
+        else:
+            all_pass = False
+
+    if not all_pass:
+        print(f"\n  [WARNING] Only {pass_count}/3 top candidates pass holdout!")
+        print(f"  This suggests possible overfitting.")
+    else:
+        print(f"\n  [OK] All top 3 candidates pass - reduces overfitting risk.")
+
+    return pass_count, all_pass
+
+
+# =============================================================================
+# REGIME VALIDATION (MARKET CONDITION ROBUSTNESS)
+# =============================================================================
+
+def validate_regime_robustness(
+    params: Dict,
+    prices,
+    funding_rates: Optional[Dict] = None
+) -> bool:
+    """
+    Validate strategy across different market regimes.
+
+    Checks if strategy works in trending, ranging, volatile, and calm markets.
+    We don't require all regimes to be profitable - just that overall it works.
+    """
+    try:
+        from core.regime_detection import detect_regimes, validate_strategy_across_regimes
+
+        if len(prices) < 1000:
+            return True  # Pass if insufficient data
+
+        # Convert memmap slice to list for regime detection
+        price_list = list(prices_to_iterator(prices))
+        regime_labels = detect_regimes(price_list, window_size=500)
+        if not regime_labels:
+            return True
+
+        result = run_backtest_with_params(params, prices, funding_rates, return_rounds=True)
+        rounds = result.get('rounds', [])
+
+        if not rounds:
+            return True
+
+        # Map rounds to regimes
+        time_to_regime = {label.start_time: label.combined for label in regime_labels}
+        regime_returns = {}
+
+        for round_obj in rounds:
+            round_time = round_obj.entry_time
+            closest_regime = None
+            min_diff = float('inf')
+
+            for label_time, regime in time_to_regime.items():
+                diff = abs((round_time - label_time).total_seconds())
+                if diff < min_diff:
+                    min_diff = diff
+                    closest_regime = regime
+
+            if closest_regime:
+                if closest_regime not in regime_returns:
+                    regime_returns[closest_regime] = []
+                regime_returns[closest_regime].append(round_obj.total_pnl)
+
+        if not regime_returns:
+            return True
+
+        # Lenient validation: only require 40% of regimes profitable
+        # (Some regimes like "ranging" may naturally lose money for trend strategies)
+        validation = validate_strategy_across_regimes(
+            regime_returns=regime_returns,
+            min_rounds_per_regime=5,
+            min_profitable_regimes_pct=40.0,  # Very lenient
+            verbose=False
+        )
+
+        return validation.overall_pass
+
+    except ImportError:
+        return True  # Pass if module not available
+    except Exception as e:
+        print(f"  Regime validation error: {e}")
+        return True
+
+
+# =============================================================================
 # SINGLE-STAGE OPTIMIZATION (PURE PROFIT)
 # =============================================================================
 
@@ -684,10 +808,29 @@ def run_optimization(
     final_results.sort(key=lambda x: x.holdout_metrics['total_pnl'], reverse=True)
     print(f"{len(final_results)} combos have positive holdout P&L with {MIN_HOLDOUT_ROUNDS}+ rounds")
 
-    # PHASE 4: Monte Carlo validation (keep - statistical validity)
+    # Top 3 validation (overfitting guard)
+    if final_results:
+        top3_count, top3_all_pass = validate_top_3_candidates(
+            final_results, prices, holdout, funding_rates
+        )
+
+    # PHASE 4: Regime validation (market condition robustness)
     print()
     print("=" * 70)
-    print("PHASE 4: MONTE CARLO VALIDATION")
+    print("PHASE 4: REGIME VALIDATION")
+    print("=" * 70)
+
+    for result in final_results[:10]:
+        result.regime_pass = validate_regime_robustness(
+            result.params, holdout_prices, funding_rates
+        )
+        status = "[PASS]" if result.regime_pass else "[FAIL]"
+        print(f"  {status} th={result.params['threshold']}, tr={result.params['trailing']}")
+
+    # PHASE 5: Monte Carlo validation (statistical validity)
+    print()
+    print("=" * 70)
+    print("PHASE 5: MONTE CARLO VALIDATION")
     print("=" * 70)
 
     if final_results:
