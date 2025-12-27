@@ -1327,6 +1327,46 @@ def select_coin_interactive() -> str:
             sys.exit(0)
 
 
+def select_thoroughness_interactive() -> ThoroughnessConfig:
+    """Display interactive thoroughness selection menu."""
+    print()
+    print("=" * 50)
+    print("SELECT ANALYSIS THOROUGHNESS")
+    print("=" * 50)
+    print()
+
+    options = [
+        ('quick', 'Quick', '~2-4 hours', '1% data, fast screening'),
+        ('standard', 'Standard', '~6-12 hours', '10% data, balanced (RECOMMENDED)'),
+        ('thorough', 'Thorough', '~24-48 hours', '20% data, deep analysis'),
+        ('exhaustive', 'Exhaustive', '~27-54 days', '100% data, maximum accuracy'),
+    ]
+
+    for i, (key, name, time, desc) in enumerate(options, 1):
+        rec = " ★" if key == 'standard' else ""
+        print(f"  {i}. {name:12} {time:15} - {desc}{rec}")
+    print()
+
+    while True:
+        try:
+            choice = input("Enter choice (1-4) [2]: ").strip()
+            if choice == "":
+                choice = "2"  # Default to standard
+            idx = int(choice) - 1
+            if 0 <= idx < len(options):
+                selected_key = options[idx][0]
+                selected = THOROUGHNESS_CONFIGS[selected_key]
+                print(f"\nSelected: {selected.name} (~{selected.estimated_time})")
+                return selected
+            else:
+                print("Invalid choice. Please enter 1-4.")
+        except ValueError:
+            print("Invalid input. Please enter a number 1-4.")
+        except KeyboardInterrupt:
+            print("\nCancelled.")
+            sys.exit(0)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Pure Profit Pyramid Strategy Optimizer v7 - 'Whatever Works'"
@@ -1362,9 +1402,9 @@ def main():
         "--thoroughness", "-t",
         type=str,
         choices=['quick', 'standard', 'thorough', 'exhaustive'],
-        default=DEFAULT_THOROUGHNESS,
+        default=None,
         help="Analysis thoroughness: quick (~2-4h), standard (~6-12h), "
-             "thorough (~24-48h), exhaustive (~27-54 days). Default: standard"
+             "thorough (~24-48h), exhaustive (~27-54 days). If not provided, shows interactive menu."
     )
     parser.add_argument(
         "--sample-rate", "-r",
@@ -1392,8 +1432,12 @@ def main():
             mc_permutation=5000,
             estimated_time='varies',
         )
-    else:
+    elif args.thoroughness is not None:
+        # CLI flag provided
         thoroughness = THOROUGHNESS_CONFIGS[args.thoroughness]
+    else:
+        # Interactive selection
+        thoroughness = select_thoroughness_interactive()
 
     results = run_optimization(
         symbol=args.symbol,
