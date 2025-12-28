@@ -290,11 +290,13 @@ def bootstrap_returns(
     if result.probability_positive < 0.80:
         failures.append(f"P(positive P&L) = {result.probability_positive:.1%} < 80%")
 
-    if result.pnl_5th_percentile < -15.0:
-        failures.append(f"5th percentile P&L = {result.pnl_5th_percentile:.1f}% < -15%")
+    # v7.7: Relaxed from -15% to -25% for aggressive trend-catching strategies
+    if result.pnl_5th_percentile < -25.0:
+        failures.append(f"5th percentile P&L = {result.pnl_5th_percentile:.1f}% < -25%")
 
-    if result.probability_ruin > 0.05:
-        failures.append(f"P(ruin) = {result.probability_ruin:.1%} > 5%")
+    # v7.7: Relaxed from 5% to 10% for higher risk tolerance
+    if result.probability_ruin > 0.10:
+        failures.append(f"P(ruin) = {result.probability_ruin:.1%} > 10%")
 
     if result.sharpe_5th_percentile < 0.5:
         failures.append(f"5th percentile Sharpe = {result.sharpe_5th_percentile:.2f} < 0.5")

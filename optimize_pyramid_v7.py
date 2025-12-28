@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 """
-Pure Profit Pyramid Strategy Optimizer (v7.6)
+Pure Profit Pyramid Strategy Optimizer (v7.7)
 
-v7.6 NEW:
+v7.7 NEW:
+- CLI options for --capital, --leverage, --position-size
+- Relaxed regime threshold: 40% → 20% (allows specialized trend strategies)
+- Relaxed 5th percentile P&L: -15% → -25% (accept bigger dips for bigger wins)
+- Relaxed P(ruin): 5% → 10% (higher risk tolerance for trend-catching)
+
+v7.6:
 - Removed arbitrary combo limits from all phases
 - All combos that pass each phase are now tested in subsequent phases
 - No more truncation that could miss better strategies
@@ -327,11 +333,16 @@ _worker_holdout_prices = None
 _worker_train_val_prices = None
 _worker_holdout_start_pct = None
 _worker_symbol = None
+# Trading configuration (v7.7 - user-configurable)
+_worker_capital = INITIAL_CAPITAL
+_worker_leverage = LEVERAGE
+_worker_position_size = POSITION_SIZE_USDT
 
 
 def init_worker(prices_file: str, meta: Dict, folds: List[Dict],
                 funding_rates: Dict, thoroughness_dict: Dict,
-                holdout_dict: Dict = None, symbol: str = None) -> None:
+                holdout_dict: Dict = None, symbol: str = None,
+                trading_config: Dict = None) -> None:
     """
     Initialize worker process globals.
 
@@ -347,11 +358,13 @@ def init_worker(prices_file: str, meta: Dict, folds: List[Dict],
         thoroughness_dict: ThoroughnessConfig as dict
         holdout_dict: Holdout configuration for Phases 2-5 (optional)
         symbol: Trading symbol for slippage estimation (optional)
+        trading_config: Dict with capital, leverage, position_size (optional)
     """
     global _worker_prices, _worker_prices_file, _worker_meta
     global _worker_folds, _worker_funding, _worker_thoroughness
     global _worker_holdout_prices, _worker_train_val_prices
     global _worker_holdout_start_pct, _worker_symbol
+    global _worker_capital, _worker_leverage, _worker_position_size
 
     from core.memmap_prices import load_prices_memmap
 
@@ -375,6 +388,12 @@ def init_worker(prices_file: str, meta: Dict, folds: List[Dict],
         _worker_holdout_start_pct = None
         _worker_train_val_prices = None
         _worker_holdout_prices = None
+
+    # Set trading configuration (v7.7 - user-configurable)
+    if trading_config is not None:
+        _worker_capital = trading_config.get('capital', INITIAL_CAPITAL)
+        _worker_leverage = trading_config.get('leverage', LEVERAGE)
+        _worker_position_size = trading_config.get('position_size', POSITION_SIZE_USDT)
 
 
 def process_single_combo(args: Tuple[int, Dict]) -> Optional[Dict]:
@@ -566,7 +585,7 @@ def process_holdout_combo(args: Tuple[int, Dict, int, int, float]) -> Dict:
         num_pyramids = holdout_result.get('avg_pyramids', 5)
         slippage_pct = estimate_round_slippage_pct(
             num_pyramids=int(num_pyramids),
-            position_size_usdt=POSITION_SIZE_USDT,
+            position_size_usdt=_worker_position_size,
             symbol=_worker_symbol or 'BTCUSDT'
         )
         total_slippage = slippage_pct * holdout_rounds
@@ -710,7 +729,8 @@ def run_parallel_grid_search(
     n_workers: int,
     csv_writer,
     storage,
-    verbose: bool = True
+    verbose: bool = True,
+    trading_config: Dict = None
 ) -> Tuple[List, int, int]:
     """
     Run Phase 1 grid search in parallel using multiprocessing.Pool.
@@ -726,6 +746,7 @@ def run_parallel_grid_search(
         csv_writer: CSV DictWriter for logging
         storage: DiskResultStorage for saving results
         verbose: Whether to print progress
+        trading_config: Dict with capital, leverage, position_size
 
     Returns:
         Tuple of (passed_combos, failed_gate_count, error_count)
@@ -762,7 +783,8 @@ def run_parallel_grid_search(
         pool = Pool(
             processes=n_workers,
             initializer=init_worker,
-            initargs=(prices_file, meta, folds, funding_rates, thoroughness_dict)
+            initargs=(prices_file, meta, folds, funding_rates, thoroughness_dict,
+                      None, None, trading_config)
         )
         signal.signal(signal.SIGINT, original_sigint)
 
@@ -853,7 +875,8 @@ def run_parallel_robustness(
     thoroughness: ThoroughnessConfig,
     n_workers: int,
     symbol: str,
-    verbose: bool = True
+    verbose: bool = True,
+    trading_config: Dict = None
 ) -> None:
     """
     Run Phase 2 robustness testing in parallel.
@@ -900,7 +923,7 @@ def run_parallel_robustness(
             processes=n_workers,
             initializer=init_worker,
             initargs=(prices_file, meta, folds, funding_rates, thoroughness_dict,
-                      holdout_dict, symbol)
+                      holdout_dict, symbol, trading_config)
         )
         signal.signal(signal.SIGINT, original_sigint)
 
@@ -945,7 +968,8 @@ def run_parallel_holdout(
     thoroughness: ThoroughnessConfig,
     n_workers: int,
     symbol: str,
-    verbose: bool = True
+    verbose: bool = True,
+    trading_config: Dict = None
 ) -> List:
     """
     Run Phase 3 holdout evaluation in parallel.
@@ -995,7 +1019,7 @@ def run_parallel_holdout(
             processes=n_workers,
             initializer=init_worker,
             initargs=(prices_file, meta, folds, funding_rates, thoroughness_dict,
-                      holdout_dict, symbol)
+                      holdout_dict, symbol, trading_config)
         )
         signal.signal(signal.SIGINT, original_sigint)
 
@@ -1054,7 +1078,8 @@ def run_parallel_regime(
     thoroughness: ThoroughnessConfig,
     n_workers: int,
     symbol: str,
-    verbose: bool = True
+    verbose: bool = True,
+    trading_config: Dict = None
 ) -> None:
     """
     Run Phase 4 regime validation in parallel.
@@ -1096,7 +1121,7 @@ def run_parallel_regime(
             processes=n_workers,
             initializer=init_worker,
             initargs=(prices_file, meta, folds, funding_rates, thoroughness_dict,
-                      holdout_dict, symbol)
+                      holdout_dict, symbol, trading_config)
         )
         signal.signal(signal.SIGINT, original_sigint)
 
@@ -1140,7 +1165,8 @@ def run_parallel_monte_carlo(
     thoroughness: ThoroughnessConfig,
     n_workers: int,
     symbol: str,
-    verbose: bool = True
+    verbose: bool = True,
+    trading_config: Dict = None
 ) -> List:
     """
     Run Phase 5 Monte Carlo validation in parallel.
@@ -1187,7 +1213,7 @@ def run_parallel_monte_carlo(
             processes=n_workers,
             initializer=init_worker,
             initargs=(prices_file, meta, folds, funding_rates, thoroughness_dict,
-                      holdout_dict, symbol)
+                      holdout_dict, symbol, trading_config)
         )
         signal.signal(signal.SIGINT, original_sigint)
 
@@ -1371,11 +1397,11 @@ def run_backtest_with_params(
         apply_funding=funding_rates is not None,
         # Rounds
         return_rounds=return_rounds,
-        # Margin
+        # Margin (use worker globals for user-configurable values)
         use_margin_tracking=USE_MARGIN_TRACKING,
-        initial_capital=INITIAL_CAPITAL,
-        leverage=LEVERAGE,
-        position_size_usdt=POSITION_SIZE_USDT,
+        initial_capital=_worker_capital,
+        leverage=_worker_leverage,
+        position_size_usdt=_worker_position_size,
     )
 
     return result
@@ -1573,12 +1599,12 @@ def validate_regime_robustness(
         if not regime_returns:
             return True
 
-        # Lenient validation: only require 40% of regimes profitable
-        # (Some regimes like "ranging" may naturally lose money for trend strategies)
+        # Ultra-lenient: only require 20% of regimes profitable (2 of 9)
+        # Allows specialized trend-catching strategies that lose in choppy markets
         validation = validate_strategy_across_regimes(
             regime_returns=regime_returns,
             min_rounds_per_regime=5,
-            min_profitable_regimes_pct=40.0,  # Very lenient
+            min_profitable_regimes_pct=20.0,  # v7.7: Ultra-lenient for trend strategies
             verbose=False
         )
 
@@ -1602,7 +1628,10 @@ def run_optimization(
     batch_size: int = DEFAULT_BATCH_SIZE,
     verbose: bool = True,
     thoroughness: ThoroughnessConfig = None,
-    workers: Optional[int] = None
+    workers: Optional[int] = None,
+    capital: float = INITIAL_CAPITAL,
+    leverage: int = LEVERAGE,
+    position_size: float = POSITION_SIZE_USDT
 ) -> List[OptimizationResult]:
     """
     Run pure profit optimized single-stage optimization.
@@ -1611,6 +1640,9 @@ def run_optimization(
         workers: Number of worker processes for parallel execution.
                 None = auto-detect (cpu_count - 1)
                 0 = force sequential mode
+        capital: Starting capital in USDT (default: 5000)
+        leverage: Leverage multiplier (default: 10)
+        position_size: Position size per entry in USDT (default: 100)
     """
     # Default to standard thoroughness if not specified
     if thoroughness is None:
@@ -1619,11 +1651,19 @@ def run_optimization(
     # Determine worker count
     n_workers = get_worker_count(workers)
 
+    # Create trading config dict for worker processes
+    trading_config = {
+        'capital': capital,
+        'leverage': leverage,
+        'position_size': position_size,
+    }
+
     print("=" * 70)
-    print("PURE PROFIT OPTIMIZER v7.6 - 'No Limits'")
+    print("PURE PROFIT OPTIMIZER v7.7 - 'No Limits'")
     print("=" * 70)
     print(f"Symbol: {symbol}")
     print(f"Days: {days}")
+    print(f"Capital: ${capital:,.0f} | Leverage: {leverage}x | Position: ${position_size:,.0f}")
     print(f"Thoroughness: {thoroughness.name} (~{thoroughness.estimated_time})")
     if n_workers > 0:
         print(f"Workers: {n_workers} (parallel mode)")
@@ -1719,7 +1759,8 @@ def run_optimization(
                 n_workers=n_workers,
                 csv_writer=csv_writer,
                 storage=storage,
-                verbose=verbose
+                verbose=verbose,
+                trading_config=trading_config
             )
         except KeyboardInterrupt:
             print("\nOptimization cancelled by user.")
@@ -1934,7 +1975,8 @@ def run_optimization(
             thoroughness=thoroughness,
             n_workers=n_workers,
             symbol=symbol,
-            verbose=verbose
+            verbose=verbose,
+            trading_config=trading_config
         )
     else:
         # Sequential robustness testing
@@ -1990,7 +2032,8 @@ def run_optimization(
             thoroughness=thoroughness,
             n_workers=n_workers,
             symbol=symbol,
-            verbose=verbose
+            verbose=verbose,
+            trading_config=trading_config
         )
     else:
         # Sequential holdout evaluation
@@ -2006,7 +2049,7 @@ def run_optimization(
             num_pyramids = holdout_result.get('avg_pyramids', 5)  # Estimate avg pyramids
             slippage_pct = estimate_round_slippage_pct(
                 num_pyramids=int(num_pyramids),
-                position_size_usdt=POSITION_SIZE_USDT,
+                position_size_usdt=position_size,
                 symbol=symbol
             )
             # Apply slippage penalty per round
@@ -2073,7 +2116,8 @@ def run_optimization(
             thoroughness=thoroughness,
             n_workers=n_workers,
             symbol=symbol,
-            verbose=verbose
+            verbose=verbose,
+            trading_config=trading_config
         )
     else:
         # Sequential regime validation
@@ -2104,7 +2148,8 @@ def run_optimization(
                     thoroughness=thoroughness,
                     n_workers=n_workers,
                     symbol=symbol,
-                    verbose=verbose
+                    verbose=verbose,
+                    trading_config=trading_config
                 )
                 print(f"\n{len(mc_validated)} combos passed Monte Carlo")
                 if mc_validated:
@@ -2519,6 +2564,24 @@ def main():
         help="Number of worker processes for parallel execution. "
              "Default: auto-detect (CPU cores - 1). Use 0 to force sequential mode."
     )
+    parser.add_argument(
+        "--capital", "-c",
+        type=float,
+        default=INITIAL_CAPITAL,
+        help=f"Starting capital in USDT (default: {INITIAL_CAPITAL})"
+    )
+    parser.add_argument(
+        "--leverage", "-l",
+        type=int,
+        default=LEVERAGE,
+        help=f"Leverage multiplier (default: {LEVERAGE})"
+    )
+    parser.add_argument(
+        "--position-size", "-p",
+        type=float,
+        default=POSITION_SIZE_USDT,
+        help=f"Position size per entry in USDT (default: {POSITION_SIZE_USDT})"
+    )
 
     args = parser.parse_args()
 
@@ -2553,7 +2616,10 @@ def main():
         batch_size=args.batch_size,
         verbose=not args.quiet,
         thoroughness=thoroughness,
-        workers=args.workers
+        workers=args.workers,
+        capital=args.capital,
+        leverage=args.leverage,
+        position_size=args.position_size
     )
 
     print()
