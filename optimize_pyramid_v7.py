@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
-Pure Profit Pyramid Strategy Optimizer (v7.1)
+Pure Profit Pyramid Strategy Optimizer (v7.5)
+
+v7.5 NEW:
+- Added progress bars to all parallel optimization phases
+- Progress visibility for Grid, Robustness, Holdout, Regime, and Monte Carlo phases
 
 v7.1 CRITICAL FIXES:
 - Fixed data leakage in robustness testing (excluded holdout data)
@@ -101,6 +105,46 @@ def check_memory_usage(context: str = "") -> None:
     elif usage_mb > MEMORY_WARNING_MB:
         print(f"\n  WARNING: Memory usage {usage_mb:.0f}MB > {MEMORY_WARNING_MB}MB [{context}]")
         gc.collect()
+
+
+# =============================================================================
+# PROGRESS BAR UTILITY (v7.5 - parallel processing visibility)
+# =============================================================================
+
+def print_progress_bar(completed: int, total: int, prefix: str = "",
+                       extra_info: str = "", start_time: float = None) -> None:
+    """
+    Print a progress bar with ETA. Works correctly with multiprocessing
+    because it runs in the main process as results arrive from workers.
+
+    Args:
+        completed: Number of items completed
+        total: Total number of items
+        prefix: Optional prefix string (e.g., "Phase 1: ")
+        extra_info: Optional extra info (e.g., "Pass: 45 | Fail: 595")
+        start_time: Start time from time.time() for ETA calculation
+    """
+    import time as time_module
+
+    pct = completed / total * 100 if total > 0 else 0
+    bar_len = 30
+    filled = int(bar_len * completed / total) if total > 0 else 0
+    bar = "█" * filled + "░" * (bar_len - filled)
+
+    if start_time and completed > 0:
+        elapsed = time_module.time() - start_time
+        eta = (total - completed) * (elapsed / completed)
+        eta_str = f"{int(eta//60)}m{int(eta%60):02d}s"
+    else:
+        eta_str = "..."
+
+    line = f"\r{prefix}[{bar}] {pct:5.1f}% | {completed}/{total}"
+    if extra_info:
+        line += f" | {extra_info}"
+    line += f" | ETA: {eta_str}"
+
+    print(line, end="", flush=True)
+    sys.stdout.flush()
 
 
 # =============================================================================
@@ -723,23 +767,10 @@ def run_parallel_grid_search(
         for result in pool.imap_unordered(process_single_combo, work_items, chunksize=10):
             completed += 1
 
-            # Progress update
-            if verbose and (completed % 5 == 0 or completed == n_combos):
-                elapsed = time_module.time() - start_time
-                pct = completed / n_combos * 100
-                if completed > 0:
-                    eta = (n_combos - completed) * (elapsed / completed)
-                    eta_str = f"{int(eta//60)}m{int(eta%60):02d}s"
-                else:
-                    eta_str = "calculating..."
-
-                bar_len = 30
-                filled = int(bar_len * completed / n_combos)
-                bar = "█" * filled + "░" * (bar_len - filled)
-
-                print(f"\r[{bar}] {pct:5.1f}% | {completed}/{n_combos} | "
-                      f"Pass: {len(passed_combos)} | Fail: {failed_gate} | ETA: {eta_str}",
-                      end="", flush=True)
+            # Progress update using helper (updates every result for responsiveness)
+            if verbose:
+                extra = f"Pass: {len(passed_combos)} | Fail: {failed_gate}"
+                print_progress_bar(completed, n_combos, "Grid: ", extra, start_time)
 
             if result is None:
                 errors += 1
@@ -869,18 +900,19 @@ def run_parallel_robustness(
         signal.signal(signal.SIGINT, original_sigint)
 
         completed = 0
+        robust_count = 0
         for result in pool.imap_unordered(process_robustness_combo, work_items, chunksize=5):
             completed += 1
             idx = result['idx']
             results[idx].robustness_score = result['robustness']
 
-            # Print status
-            robustness = result['robustness']
-            params = results[idx].params
-            if robustness < MIN_ROBUSTNESS_SCORE:
-                print(f"  [FRAGILE] th={params['threshold']}, tr={params['trailing']}: robustness={robustness:.2f}")
-            else:
-                print(f"  [ROBUST]  th={params['threshold']}, tr={params['trailing']}: robustness={robustness:.2f}")
+            if result['robustness'] >= MIN_ROBUSTNESS_SCORE:
+                robust_count += 1
+
+            # Progress bar update
+            if verbose:
+                extra = f"Robust: {robust_count} | Fragile: {completed - robust_count}"
+                print_progress_bar(completed, n_items, "  Robustness: ", extra, start_time)
 
         pool.close()
         pool.join()
@@ -891,6 +923,8 @@ def run_parallel_robustness(
         pool.join()
         raise
 
+    if verbose:
+        print()  # Newline after progress bar
     elapsed = time_module.time() - start_time
     if verbose:
         print(f"  Robustness phase completed in {elapsed:.1f}s")
@@ -960,7 +994,9 @@ def run_parallel_holdout(
         )
         signal.signal(signal.SIGINT, original_sigint)
 
+        completed = 0
         for result_data in pool.imap_unordered(process_holdout_combo, work_items, chunksize=10):
+            completed += 1
             idx = result_data['idx']
             result = results[idx]
 
@@ -978,6 +1014,11 @@ def run_parallel_holdout(
                     result.is_significant):
                     holdout_candidates.append(result)
 
+            # Progress bar update
+            if verbose:
+                extra = f"Pass: {len(holdout_candidates)}"
+                print_progress_bar(completed, n_items, "  Holdout: ", extra, start_time)
+
         pool.close()
         pool.join()
 
@@ -987,6 +1028,8 @@ def run_parallel_holdout(
         pool.join()
         raise
 
+    if verbose:
+        print()  # Newline after progress bar
     elapsed = time_module.time() - start_time
     if verbose:
         print(f"  Holdout phase completed in {elapsed:.1f}s")
@@ -1052,12 +1095,19 @@ def run_parallel_regime(
         )
         signal.signal(signal.SIGINT, original_sigint)
 
+        completed = 0
+        pass_count = 0
         for result_data in pool.imap_unordered(process_regime_combo, work_items, chunksize=2):
+            completed += 1
             idx = result_data['idx']
             results[idx].regime_pass = result_data['regime_pass']
-            status = "[PASS]" if result_data['regime_pass'] else "[FAIL]"
-            params = results[idx].params
-            print(f"  {status} th={params['threshold']}, tr={params['trailing']}")
+            if result_data['regime_pass']:
+                pass_count += 1
+
+            # Progress bar update
+            if verbose:
+                extra = f"Pass: {pass_count} | Fail: {completed - pass_count}"
+                print_progress_bar(completed, n_items, "  Regime: ", extra, start_time)
 
         pool.close()
         pool.join()
@@ -1068,6 +1118,8 @@ def run_parallel_regime(
         pool.join()
         raise
 
+    if verbose:
+        print()  # Newline after progress bar
     elapsed = time_module.time() - start_time
     if verbose:
         print(f"  Regime phase completed in {elapsed:.1f}s")
@@ -1134,7 +1186,9 @@ def run_parallel_monte_carlo(
         )
         signal.signal(signal.SIGINT, original_sigint)
 
+        completed = 0
         for result_data in pool.imap_unordered(process_monte_carlo_combo, work_items, chunksize=5):
+            completed += 1
             idx = result_data['idx']
             result = results[idx]
 
@@ -1144,14 +1198,13 @@ def run_parallel_monte_carlo(
             result.mc_sharpe_5th = result_data['mc_sharpe_5th']
             result.mc_sequence_matters = result_data['mc_sequence_matters']
 
-            params = result.params
             if result_data['mc_passes']:
                 mc_validated.append(result)
-                print(f"  [PASS] th={params['threshold']}, tr={params['trailing']}, "
-                      f"P(+)={result_data['mc_prob_positive']:.1%}, "
-                      f"Holdout P&L={result_data['holdout_pnl']:.1f}%")
-            else:
-                print(f"  [FAIL] th={params['threshold']}, tr={params['trailing']}")
+
+            # Progress bar update
+            if verbose:
+                extra = f"Pass: {len(mc_validated)} | Fail: {completed - len(mc_validated)}"
+                print_progress_bar(completed, n_items, "  Monte Carlo: ", extra, start_time)
 
         pool.close()
         pool.join()
@@ -1162,6 +1215,8 @@ def run_parallel_monte_carlo(
         pool.join()
         raise
 
+    if verbose:
+        print()  # Newline after progress bar
     elapsed = time_module.time() - start_time
     if verbose:
         print(f"  Monte Carlo phase completed in {elapsed:.1f}s")
@@ -1560,7 +1615,7 @@ def run_optimization(
     n_workers = get_worker_count(workers)
 
     print("=" * 70)
-    print("PURE PROFIT OPTIMIZER v7.4 - 'Maximum Parallelization'")
+    print("PURE PROFIT OPTIMIZER v7.5 - 'Progress Visibility'")
     print("=" * 70)
     print(f"Symbol: {symbol}")
     print(f"Days: {days}")
