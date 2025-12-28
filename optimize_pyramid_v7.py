@@ -2513,6 +2513,132 @@ def select_thoroughness_interactive() -> ThoroughnessConfig:
             sys.exit(0)
 
 
+def select_trading_config_interactive() -> dict:
+    """Display interactive trading configuration menu."""
+    print()
+    print("=" * 50)
+    print("TRADING CONFIGURATION")
+    print("=" * 50)
+    print()
+
+    # Starting Capital
+    print("Starting Capital (USDT):")
+    capital_options = [1000, 5000, 10000, 25000, 50000, 100000]
+    for i, cap in enumerate(capital_options, 1):
+        default = " (default)" if cap == 5000 else ""
+        print(f"  {i}. ${cap:,}{default}")
+    print(f"  7. Custom amount")
+    print()
+
+    while True:
+        try:
+            choice = input("Enter choice (1-7) [2]: ").strip()
+            if choice == "":
+                capital = 5000
+                break
+            idx = int(choice)
+            if 1 <= idx <= 6:
+                capital = capital_options[idx - 1]
+                break
+            elif idx == 7:
+                custom = input("Enter custom capital: $").strip().replace(",", "")
+                capital = float(custom)
+                break
+            else:
+                print("Invalid choice.")
+        except ValueError:
+            print("Invalid input.")
+        except KeyboardInterrupt:
+            print("\nCancelled.")
+            sys.exit(0)
+
+    print(f"  → Capital: ${capital:,.0f}")
+    print()
+
+    # Leverage
+    print("Leverage Multiplier:")
+    leverage_options = [1, 2, 5, 10, 20, 50, 100]
+    for i, lev in enumerate(leverage_options, 1):
+        default = " (default)" if lev == 10 else ""
+        print(f"  {i}. {lev}x{default}")
+    print()
+
+    while True:
+        try:
+            choice = input("Enter choice (1-7) [4]: ").strip()
+            if choice == "":
+                leverage = 10
+                break
+            idx = int(choice)
+            if 1 <= idx <= 7:
+                leverage = leverage_options[idx - 1]
+                break
+            else:
+                print("Invalid choice.")
+        except ValueError:
+            print("Invalid input.")
+        except KeyboardInterrupt:
+            print("\nCancelled.")
+            sys.exit(0)
+
+    print(f"  → Leverage: {leverage}x")
+    print()
+
+    # Position Size
+    print("Position Size per Entry (USDT):")
+    size_options = [25, 50, 100, 250, 500, 1000]
+    for i, size in enumerate(size_options, 1):
+        default = " (default)" if size == 100 else ""
+        print(f"  {i}. ${size}{default}")
+    print(f"  7. Custom amount")
+    print()
+
+    while True:
+        try:
+            choice = input("Enter choice (1-7) [3]: ").strip()
+            if choice == "":
+                position_size = 100
+                break
+            idx = int(choice)
+            if 1 <= idx <= 6:
+                position_size = size_options[idx - 1]
+                break
+            elif idx == 7:
+                custom = input("Enter custom position size: $").strip().replace(",", "")
+                position_size = float(custom)
+                break
+            else:
+                print("Invalid choice.")
+        except ValueError:
+            print("Invalid input.")
+        except KeyboardInterrupt:
+            print("\nCancelled.")
+            sys.exit(0)
+
+    print(f"  → Position Size: ${position_size:,.0f}")
+    print()
+
+    # Summary
+    max_margin_20 = position_size * 20
+    max_margin_50 = position_size * 50
+    print("=" * 50)
+    print("CONFIGURATION SUMMARY")
+    print("=" * 50)
+    print(f"  Capital:       ${capital:,.0f}")
+    print(f"  Leverage:      {leverage}x")
+    print(f"  Position Size: ${position_size:,.0f}")
+    print(f"  Notional/Entry: ${position_size * leverage:,.0f}")
+    print(f"  Max Margin (20 pyramids): ${max_margin_20:,.0f} ({max_margin_20/capital*100:.0f}% of capital)")
+    print(f"  Max Margin (50 pyramids): ${max_margin_50:,.0f} ({max_margin_50/capital*100:.0f}% of capital)")
+    print()
+
+    return {
+        'capital': capital,
+        'leverage': leverage,
+        'position_size': position_size,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Pure Profit Pyramid Strategy Optimizer v7 - 'Whatever Works'"
@@ -2568,20 +2694,20 @@ def main():
     parser.add_argument(
         "--capital", "-c",
         type=float,
-        default=INITIAL_CAPITAL,
-        help=f"Starting capital in USDT (default: {INITIAL_CAPITAL})"
+        default=None,
+        help=f"Starting capital in USDT. If not provided, shows interactive menu."
     )
     parser.add_argument(
         "--leverage", "-l",
         type=int,
-        default=LEVERAGE,
-        help=f"Leverage multiplier (default: {LEVERAGE})"
+        default=None,
+        help=f"Leverage multiplier. If not provided, shows interactive menu."
     )
     parser.add_argument(
         "--position-size", "-p",
         type=float,
-        default=POSITION_SIZE_USDT,
-        help=f"Position size per entry in USDT (default: {POSITION_SIZE_USDT})"
+        default=None,
+        help=f"Position size per entry in USDT. If not provided, shows interactive menu."
     )
 
     args = parser.parse_args()
@@ -2589,6 +2715,20 @@ def main():
     # Interactive coin selection if no symbol provided
     if args.symbol is None:
         args.symbol = select_coin_interactive()
+
+    # Interactive trading config if not all provided via CLI
+    if args.capital is None or args.leverage is None or args.position_size is None:
+        trading_config = select_trading_config_interactive()
+        # Use interactive values, but allow CLI overrides
+        if args.capital is None:
+            args.capital = trading_config['capital']
+        if args.leverage is None:
+            args.leverage = trading_config['leverage']
+        if args.position_size is None:
+            args.position_size = trading_config['position_size']
+    else:
+        # All provided via CLI - no interactive menu
+        pass
 
     # Resolve thoroughness config
     if args.sample_rate is not None:
