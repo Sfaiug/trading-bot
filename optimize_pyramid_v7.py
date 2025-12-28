@@ -38,6 +38,9 @@ import json
 import gc
 import resource
 import argparse
+import signal
+import multiprocessing as mp
+from multiprocessing import Pool
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass, field
@@ -240,15 +243,365 @@ class OptimizationResult:
 
 
 # =============================================================================
+# MULTIPROCESSING SUPPORT (v7.3)
+# =============================================================================
+
+def get_worker_count(requested: Optional[int] = None) -> int:
+    """
+    Determine number of worker processes for parallel execution.
+
+    Args:
+        requested: User-specified worker count (--workers flag)
+                  None = auto-detect (cpu_count - 1)
+                  0 = force sequential mode
+
+    Returns:
+        Number of workers (0 for sequential, 1+ for parallel)
+    """
+    if requested == 0:
+        return 0  # Force sequential mode
+    if requested is not None:
+        return max(1, min(requested, os.cpu_count() or 4))
+    # Auto-detect: use all cores minus 1 (leave one for OS/main process)
+    return max(1, (os.cpu_count() or 4) - 1)
+
+
+# Worker process globals (set by init_worker, used by process_single_combo)
+_worker_prices = None
+_worker_prices_file = None
+_worker_meta = None
+_worker_folds = None
+_worker_funding = None
+_worker_thoroughness = None
+
+
+def init_worker(prices_file: str, meta: Dict, folds: List[Dict],
+                funding_rates: Dict, thoroughness_dict: Dict) -> None:
+    """
+    Initialize worker process globals.
+
+    Called once per worker by Pool. Re-opens memmap in worker process
+    for cross-platform safety. On fork-based systems (macOS/Linux),
+    this shares physical memory pages via copy-on-write.
+    """
+    global _worker_prices, _worker_prices_file, _worker_meta
+    global _worker_folds, _worker_funding, _worker_thoroughness
+
+    from core.memmap_prices import load_prices_memmap
+
+    _worker_prices_file = prices_file
+    _worker_meta = meta
+    _worker_folds = folds
+    _worker_funding = funding_rates
+    _worker_thoroughness = ThoroughnessConfig(**thoroughness_dict)
+
+    # Re-open memmap in worker (shares pages via COW on fork)
+    _worker_prices = load_prices_memmap(prices_file, meta)
+
+
+def process_single_combo(args: Tuple[int, Dict]) -> Optional[Dict]:
+    """
+    Process a single parameter combination (worker function).
+
+    Args:
+        args: Tuple of (combo_idx, params)
+
+    Returns:
+        Dict with all result data, or dict with error/failure info.
+
+    Uses worker globals set by init_worker.
+    """
+    combo_idx, params = args
+    sample_rate = _worker_thoroughness.sample_rate
+
+    try:
+        # Get fold 0 for initial train/val split
+        fold = _worker_folds[0]
+        train_prices, val_prices = slice_prices_for_fold(_worker_prices, fold)
+
+        # Run training backtest
+        train_result = run_backtest_with_params(
+            params, train_prices, _worker_funding,
+            return_rounds=True, sample_rate=sample_rate
+        )
+
+        # Run validation backtest
+        val_result = run_backtest_with_params(
+            params, val_prices, _worker_funding,
+            return_rounds=False, sample_rate=sample_rate
+        )
+
+        # Check validation gate
+        gate_passed, gate_reason = check_validation_gate(
+            train_result, val_result,
+            min_val_pnl_ratio=MIN_VAL_PNL_RATIO,
+            min_val_rounds=MIN_VAL_ROUNDS
+        )
+
+        # Build CSV row data
+        csv_row = {
+            'threshold': params.get('threshold'),
+            'trailing': params.get('trailing'),
+            'pyramid_step': params.get('pyramid_step'),
+            'max_pyramids': params.get('max_pyramids'),
+            'vol_type': params.get('vol_type'),
+            'size_schedule': params.get('size_schedule'),
+            'train_pnl': train_result.get('total_pnl', 0),
+            'val_pnl': val_result.get('total_pnl', 0),
+            'win_rate': train_result.get('win_rate', 0),
+            'rounds': train_result.get('total_rounds', 0),
+            'max_drawdown_pct': train_result.get('max_drawdown_pct', 0),
+            'passed_gate': gate_passed,
+            'is_significant': False,
+            'p_value': 1.0,
+        }
+
+        if not gate_passed:
+            return {
+                'combo_idx': combo_idx,
+                'passed': False,
+                'reason': gate_reason,
+                'params': params,
+                'csv_row': csv_row,
+            }
+
+        # Cross-fold validation
+        crossfold_rate = max(1, sample_rate // _worker_thoroughness.crossfold_divisor)
+        total_pnl_positive, fold_pnls, avg_val_pnl = validate_across_all_folds(
+            params, _worker_prices, _worker_folds, _worker_funding,
+            sample_rate=crossfold_rate
+        )
+
+        # Collect rounds data for storage
+        rounds_data = []
+        for r in train_result.get('rounds', []):
+            rounds_data.append({
+                'timestamp': str(getattr(r, 'entry_time', '')),
+                'pnl_pct': getattr(r, 'total_pnl', 0),
+                'duration_sec': 0,
+                'num_pyramids': getattr(r, 'num_pyramids', 0),
+            })
+
+        return {
+            'combo_idx': combo_idx,
+            'passed': True,
+            'params': params,
+            'csv_row': csv_row,
+            'train_metrics': {
+                'total_pnl': train_result.get('total_pnl', 0),
+                'win_rate': train_result.get('win_rate', 0),
+                'total_rounds': train_result.get('total_rounds', 0),
+                'max_drawdown_pct': train_result.get('max_drawdown_pct', 0),
+            },
+            'val_metrics': {
+                'total_pnl': val_result.get('total_pnl', 0),
+                'win_rate': val_result.get('win_rate', 0),
+                'total_rounds': val_result.get('total_rounds', 0),
+            },
+            'fold_pnls': fold_pnls,
+            'avg_val_pnl': avg_val_pnl,
+            'total_pnl_positive': total_pnl_positive,
+            'per_round_returns': train_result.get('per_round_returns', []),
+            'rounds_data': rounds_data,
+            'summary': {
+                'total_pnl': train_result.get('total_pnl', 0),
+                'total_rounds': train_result.get('total_rounds', 0),
+                'win_rate': train_result.get('win_rate', 0),
+            },
+        }
+
+    except Exception as e:
+        import traceback
+        return {
+            'combo_idx': combo_idx,
+            'passed': False,
+            'error': str(e),
+            'traceback': traceback.format_exc(),
+            'params': params,
+            'csv_row': {
+                'threshold': params.get('threshold'),
+                'trailing': params.get('trailing'),
+                'pyramid_step': params.get('pyramid_step'),
+                'max_pyramids': params.get('max_pyramids'),
+                'vol_type': params.get('vol_type'),
+                'size_schedule': params.get('size_schedule'),
+                'train_pnl': 0,
+                'val_pnl': 0,
+                'win_rate': 0,
+                'rounds': 0,
+                'max_drawdown_pct': 0,
+                'passed_gate': False,
+                'is_significant': False,
+                'p_value': 1.0,
+            },
+        }
+
+
+def run_parallel_grid_search(
+    all_combos: List[Dict],
+    prices_file: str,
+    meta: Dict,
+    folds: List[Dict],
+    funding_rates: Dict,
+    thoroughness: ThoroughnessConfig,
+    n_workers: int,
+    csv_writer,
+    storage,
+    verbose: bool = True
+) -> Tuple[List, int, int]:
+    """
+    Run Phase 1 grid search in parallel using multiprocessing.Pool.
+
+    Args:
+        all_combos: List of parameter dicts to test
+        prices_file: Path to memmap file (workers re-open)
+        meta: Memmap metadata dict
+        folds: List of fold configurations
+        funding_rates: Funding rate dict
+        thoroughness: ThoroughnessConfig for sample rates
+        n_workers: Number of worker processes
+        csv_writer: CSV DictWriter for logging
+        storage: DiskResultStorage for saving results
+        verbose: Whether to print progress
+
+    Returns:
+        Tuple of (passed_combos, failed_gate_count, error_count)
+    """
+    import time as time_module
+
+    n_combos = len(all_combos)
+    passed_combos = []
+    failed_gate = 0
+    errors = 0
+
+    # Prepare work items: (combo_idx, params)
+    work_items = [(i + 1, params) for i, params in enumerate(all_combos)]
+
+    # Convert thoroughness to dict for pickling
+    thoroughness_dict = {
+        'name': thoroughness.name,
+        'sample_rate': thoroughness.sample_rate,
+        'crossfold_divisor': thoroughness.crossfold_divisor,
+        'robustness_divisor': thoroughness.robustness_divisor,
+        'holdout_sample_rate': thoroughness.holdout_sample_rate,
+        'mc_bootstrap': thoroughness.mc_bootstrap,
+        'mc_permutation': thoroughness.mc_permutation,
+        'estimated_time': thoroughness.estimated_time,
+    }
+
+    print(f"Starting parallel grid search with {n_workers} workers...")
+    start_time = time_module.time()
+
+    # Graceful shutdown handler
+    original_sigint = signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+    try:
+        pool = Pool(
+            processes=n_workers,
+            initializer=init_worker,
+            initargs=(prices_file, meta, folds, funding_rates, thoroughness_dict)
+        )
+        signal.signal(signal.SIGINT, original_sigint)
+
+        completed = 0
+
+        # Use imap_unordered for streaming results as they complete
+        for result in pool.imap_unordered(process_single_combo, work_items, chunksize=10):
+            completed += 1
+
+            # Progress update
+            if verbose and (completed % 5 == 0 or completed == n_combos):
+                elapsed = time_module.time() - start_time
+                pct = completed / n_combos * 100
+                if completed > 0:
+                    eta = (n_combos - completed) * (elapsed / completed)
+                    eta_str = f"{int(eta//60)}m{int(eta%60):02d}s"
+                else:
+                    eta_str = "calculating..."
+
+                bar_len = 30
+                filled = int(bar_len * completed / n_combos)
+                bar = "█" * filled + "░" * (bar_len - filled)
+
+                print(f"\r[{bar}] {pct:5.1f}% | {completed}/{n_combos} | "
+                      f"Pass: {len(passed_combos)} | Fail: {failed_gate} | ETA: {eta_str}",
+                      end="", flush=True)
+
+            if result is None:
+                errors += 1
+                continue
+
+            # Log to CSV
+            if 'csv_row' in result:
+                csv_writer.writerow(result['csv_row'])
+
+            # Handle errors
+            if 'error' in result:
+                errors += 1
+                if verbose:
+                    print(f"\n  [ERROR] Combo {result['combo_idx']}: {result['error']}")
+                continue
+
+            # Handle failed gate
+            if not result['passed']:
+                failed_gate += 1
+                continue
+
+            # Build OptimizationResult for passed combos
+            opt_result = OptimizationResult(
+                params=result['params'],
+                train_metrics=result['train_metrics'],
+                val_metrics=result['val_metrics'],
+                holdout_metrics=None,
+                passed_gate=True,
+                is_significant=False,
+                p_value=1.0,
+                sharpe=0.0,  # Will be calculated after storage save
+                per_round_returns=result['per_round_returns'],
+                fold_pnls=result['fold_pnls'],
+                total_pnl_positive=result['total_pnl_positive'],
+                avg_val_pnl=result['avg_val_pnl'],
+            )
+            passed_combos.append(opt_result)
+
+            # Save to storage and calculate Sharpe
+            storage.save_combo_result(
+                result['params'],
+                result['rounds_data'],
+                result['summary']
+            )
+            try:
+                opt_result.sharpe = calculate_real_sharpe(storage, result['params'])
+            except ValueError:
+                opt_result.sharpe = 0.0
+
+        pool.close()
+        pool.join()
+
+    except KeyboardInterrupt:
+        print("\n\nShutdown requested. Terminating workers...")
+        pool.terminate()
+        pool.join()
+        print(f"Terminated. Returning {len(passed_combos)} partial results.")
+        raise
+
+    print()  # New line after progress bar
+    return passed_combos, failed_gate, errors
+
+
+# =============================================================================
 # DATA LOADING (MEMORY-EFFICIENT DISK-BASED)
 # =============================================================================
 
-def load_tick_data_memmap(symbol: str, days: int) -> Tuple[any, Dict, Dict]:
+def load_tick_data_memmap(symbol: str, days: int) -> Tuple[any, Dict, Dict, str]:
     """
     Load tick data using memory-mapped files (LOW RAM USAGE).
 
     Downloads data to disk month-by-month (never all in RAM), then
     memory-maps the file for efficient access. OS handles paging.
+
+    Returns:
+        Tuple of (prices, meta, funding_rates, prices_file_path)
     """
     from core.memmap_prices import (
         ensure_prices_on_disk,
@@ -278,7 +631,7 @@ def load_tick_data_memmap(symbol: str, days: int) -> Tuple[any, Dict, Dict]:
     if APPLY_FUNDING_RATES:
         funding_rates = load_funding_rates(symbol, years)
 
-    return prices, meta, funding_rates
+    return prices, meta, funding_rates, prices_file
 
 
 def slice_prices_for_fold(prices, fold: Dict) -> Tuple[any, any]:
@@ -608,21 +961,34 @@ def run_optimization(
     output_dir: str = "./optimization_v7_results",
     batch_size: int = DEFAULT_BATCH_SIZE,
     verbose: bool = True,
-    thoroughness: ThoroughnessConfig = None
+    thoroughness: ThoroughnessConfig = None,
+    workers: Optional[int] = None
 ) -> List[OptimizationResult]:
     """
     Run pure profit optimized single-stage optimization.
+
+    Args:
+        workers: Number of worker processes for parallel execution.
+                None = auto-detect (cpu_count - 1)
+                0 = force sequential mode
     """
     # Default to standard thoroughness if not specified
     if thoroughness is None:
         thoroughness = THOROUGHNESS_CONFIGS[DEFAULT_THOROUGHNESS]
 
+    # Determine worker count
+    n_workers = get_worker_count(workers)
+
     print("=" * 70)
-    print("PURE PROFIT OPTIMIZER v7.2 - 'Whatever Works'")
+    print("PURE PROFIT OPTIMIZER v7.3 - 'Whatever Works'")
     print("=" * 70)
     print(f"Symbol: {symbol}")
     print(f"Days: {days}")
     print(f"Thoroughness: {thoroughness.name} (~{thoroughness.estimated_time})")
+    if n_workers > 0:
+        print(f"Workers: {n_workers} (parallel mode)")
+    else:
+        print("Workers: 1 (sequential mode)")
     print(f"  - Grid sample rate: 1/{thoroughness.sample_rate} ({100/thoroughness.sample_rate:.0f}% data)")
     print(f"  - Holdout sample rate: 1/{thoroughness.holdout_sample_rate} ({100/thoroughness.holdout_sample_rate:.0f}% data)")
     print(f"  - Monte Carlo: {thoroughness.mc_bootstrap:,} bootstrap, {thoroughness.mc_permutation:,} permutation")
@@ -661,7 +1027,7 @@ def run_optimization(
     # Load data (DISK-BASED)
     print("Loading tick data (memory-efficient disk mode)...")
     try:
-        prices, meta, funding_rates = load_tick_data_memmap(symbol, days)
+        prices, meta, funding_rates, prices_file = load_tick_data_memmap(symbol, days)
         print(f"Loaded {meta['total_prices']:,} prices (memory-mapped from disk)")
     except Exception as e:
         print(f"Error loading data: {e}")
@@ -693,171 +1059,189 @@ def run_optimization(
     # Track results
     passed_combos: List[OptimizationResult] = []
     failed_gate = 0
-    not_significant = 0
+    errors = 0
 
     # Process all combinations with real-time progress
     print(f"Processing {n_combos:,} combinations...")
     print("-" * 70)
 
-    # Timing for progress estimation
-    import time as time_module
-    start_time = time_module.time()
-    last_update_time = start_time
-    combo_times = []  # Track time per combo for ETA
-
-    for batch_start in range(0, n_combos, batch_size):
-        batch_end = min(batch_start + batch_size, n_combos)
-        batch = all_combos[batch_start:batch_end]
-
-        for i, params in enumerate(batch):
-            combo_idx = batch_start + i + 1
-            combo_start = time_module.time()
-
-            # Real-time progress bar (update every combo)
-            if verbose:
-                elapsed = time_module.time() - start_time
-                elapsed_str = f"{int(elapsed//60)}m{int(elapsed%60):02d}s"
-
-                # Calculate ETA from average combo time
-                if combo_times:
-                    avg_time = sum(combo_times[-20:]) / len(combo_times[-20:])  # Last 20 combos
-                    remaining = (n_combos - combo_idx) * avg_time
-                    eta_str = f"{int(remaining//60)}m{int(remaining%60):02d}s"
-                else:
-                    eta_str = "calculating..."
-
-                pct = combo_idx / n_combos * 100
-                bar_len = 30
-                filled = int(bar_len * combo_idx / n_combos)
-                bar = "█" * filled + "░" * (bar_len - filled)
-
-                print(f"\r[{bar}] {pct:5.1f}% | {combo_idx}/{n_combos} | "
-                      f"Elapsed: {elapsed_str} | ETA: {eta_str} | "
-                      f"Pass: {len(passed_combos)} | Fail: {failed_gate}",
-                      end="", flush=True)
-
-            # Test on FOLD 0 first
-            fold = folds[0]
-            train_prices, val_prices = slice_prices_for_fold(prices, fold)
-
-            # Run training backtest (with sampling for speed)
-            train_result = run_backtest_with_params(params, train_prices, funding_rates, sample_rate=thoroughness.sample_rate)
-
-            # MINIMAL VALIDATION GATE (just checks overfitting and round count)
-            val_result = run_backtest_with_params(params, val_prices, funding_rates, sample_rate=thoroughness.sample_rate)
-
-            gate_passed, gate_reason = check_validation_gate(
-                train_result, val_result,
-                min_val_pnl_ratio=MIN_VAL_PNL_RATIO,
-                min_val_rounds=MIN_VAL_ROUNDS
+    # PHASE 1: Grid search (parallel or sequential)
+    if n_workers > 0:
+        # Parallel mode using multiprocessing
+        try:
+            passed_combos, failed_gate, errors = run_parallel_grid_search(
+                all_combos=all_combos,
+                prices_file=prices_file,
+                meta=meta,
+                folds=folds,
+                funding_rates=funding_rates,
+                thoroughness=thoroughness,
+                n_workers=n_workers,
+                csv_writer=csv_writer,
+                storage=storage,
+                verbose=verbose
             )
+        except KeyboardInterrupt:
+            print("\nOptimization cancelled by user.")
+            csv_f.close()
+            return passed_combos if passed_combos else []
+        except Exception as e:
+            print(f"\n[WARNING] Parallel execution failed: {e}")
+            print("[FALLBACK] Switching to sequential mode...")
+            n_workers = 0  # Fall back to sequential
 
-            # Log to CSV
-            csv_row = {
-                'threshold': params.get('threshold'),
-                'trailing': params.get('trailing'),
-                'pyramid_step': params.get('pyramid_step'),
-                'max_pyramids': params.get('max_pyramids'),
-                'vol_type': params.get('vol_type'),
-                'size_schedule': params.get('size_schedule'),
-                'train_pnl': train_result.get('total_pnl', 0),
-                'val_pnl': val_result.get('total_pnl', 0),
-                'win_rate': train_result.get('win_rate', 0),
-                'rounds': train_result.get('total_rounds', 0),
-                'max_drawdown_pct': train_result.get('max_drawdown_pct', 0),
-                'passed_gate': gate_passed,
-                'is_significant': False,
-                'p_value': 1.0,
-            }
+    if n_workers == 0:
+        # Sequential mode (original implementation)
+        import time as time_module
+        start_time = time_module.time()
+        combo_times = []
 
-            if not gate_passed:
-                failed_gate += 1
+        for batch_start in range(0, n_combos, batch_size):
+            batch_end = min(batch_start + batch_size, n_combos)
+            batch = all_combos[batch_start:batch_end]
+
+            for i, params in enumerate(batch):
+                combo_idx = batch_start + i + 1
+                combo_start = time_module.time()
+
+                # Real-time progress bar
+                if verbose:
+                    elapsed = time_module.time() - start_time
+                    elapsed_str = f"{int(elapsed//60)}m{int(elapsed%60):02d}s"
+
+                    if combo_times:
+                        avg_time = sum(combo_times[-20:]) / len(combo_times[-20:])
+                        remaining = (n_combos - combo_idx) * avg_time
+                        eta_str = f"{int(remaining//60)}m{int(remaining%60):02d}s"
+                    else:
+                        eta_str = "calculating..."
+
+                    pct = combo_idx / n_combos * 100
+                    bar_len = 30
+                    filled = int(bar_len * combo_idx / n_combos)
+                    bar = "█" * filled + "░" * (bar_len - filled)
+
+                    print(f"\r[{bar}] {pct:5.1f}% | {combo_idx}/{n_combos} | "
+                          f"Elapsed: {elapsed_str} | ETA: {eta_str} | "
+                          f"Pass: {len(passed_combos)} | Fail: {failed_gate}",
+                          end="", flush=True)
+
+                # Test on FOLD 0 first
+                fold = folds[0]
+                train_prices, val_prices = slice_prices_for_fold(prices, fold)
+
+                # Run training backtest (with sampling for speed)
+                train_result = run_backtest_with_params(params, train_prices, funding_rates, sample_rate=thoroughness.sample_rate)
+
+                # MINIMAL VALIDATION GATE
+                val_result = run_backtest_with_params(params, val_prices, funding_rates, sample_rate=thoroughness.sample_rate)
+
+                gate_passed, gate_reason = check_validation_gate(
+                    train_result, val_result,
+                    min_val_pnl_ratio=MIN_VAL_PNL_RATIO,
+                    min_val_rounds=MIN_VAL_ROUNDS
+                )
+
+                # Log to CSV
+                csv_row = {
+                    'threshold': params.get('threshold'),
+                    'trailing': params.get('trailing'),
+                    'pyramid_step': params.get('pyramid_step'),
+                    'max_pyramids': params.get('max_pyramids'),
+                    'vol_type': params.get('vol_type'),
+                    'size_schedule': params.get('size_schedule'),
+                    'train_pnl': train_result.get('total_pnl', 0),
+                    'val_pnl': val_result.get('total_pnl', 0),
+                    'win_rate': train_result.get('win_rate', 0),
+                    'rounds': train_result.get('total_rounds', 0),
+                    'max_drawdown_pct': train_result.get('max_drawdown_pct', 0),
+                    'passed_gate': gate_passed,
+                    'is_significant': False,
+                    'p_value': 1.0,
+                }
+
+                if not gate_passed:
+                    failed_gate += 1
+                    csv_writer.writerow(csv_row)
+                    combo_time = time_module.time() - combo_start
+                    combo_times.append(combo_time)
+                    if len(combo_times) > 100:
+                        combo_times = combo_times[-50:]
+                    continue
+
+                per_round_returns = train_result.get('per_round_returns', [])
+                csv_row['is_significant'] = True
+                csv_row['p_value'] = 0.0
                 csv_writer.writerow(csv_row)
-                # Track combo time even for failed combos
+
+                # Cross-fold validation
+                crossfold_rate = max(1, thoroughness.sample_rate // thoroughness.crossfold_divisor)
+                total_pnl_positive, fold_pnls, avg_val_pnl = validate_across_all_folds(
+                    params, prices, folds, funding_rates, sample_rate=crossfold_rate
+                )
+
+                # Save to storage
+                rounds_data = []
+                for r in train_result.get('rounds', []):
+                    rounds_data.append({
+                        'timestamp': str(getattr(r, 'entry_time', '')),
+                        'pnl_pct': getattr(r, 'total_pnl', 0),
+                        'duration_sec': 0,
+                        'num_pyramids': getattr(r, 'num_pyramids', 0),
+                    })
+
+                summary = {
+                    'total_pnl': train_result.get('total_pnl', 0),
+                    'total_rounds': train_result.get('total_rounds', 0),
+                    'win_rate': train_result.get('win_rate', 0),
+                }
+
+                storage.save_combo_result(params, rounds_data, summary)
+
+                # Calculate Sharpe
+                try:
+                    sharpe = calculate_real_sharpe(storage, params)
+                except ValueError:
+                    sharpe = 0.0
+
+                # Record passed combo
+                result = OptimizationResult(
+                    params=params,
+                    train_metrics={
+                        'total_pnl': train_result.get('total_pnl', 0),
+                        'win_rate': train_result.get('win_rate', 0),
+                        'total_rounds': train_result.get('total_rounds', 0),
+                        'max_drawdown_pct': train_result.get('max_drawdown_pct', 0),
+                    },
+                    val_metrics={
+                        'total_pnl': val_result.get('total_pnl', 0),
+                        'win_rate': val_result.get('win_rate', 0),
+                        'total_rounds': val_result.get('total_rounds', 0),
+                    },
+                    holdout_metrics=None,
+                    passed_gate=True,
+                    is_significant=False,
+                    p_value=1.0,
+                    sharpe=sharpe,
+                    per_round_returns=per_round_returns,
+                    fold_pnls=fold_pnls,
+                    total_pnl_positive=total_pnl_positive,
+                    avg_val_pnl=avg_val_pnl,
+                )
+                passed_combos.append(result)
+
+                # Track combo time
                 combo_time = time_module.time() - combo_start
                 combo_times.append(combo_time)
-                # Prevent memory leak - keep only last 50 times for ETA
                 if len(combo_times) > 100:
                     combo_times = combo_times[-50:]
-                continue
 
-            # v7.1 FIX: Removed Bonferroni check from training phase
-            # Bonferroni is now applied in holdout phase (Phase 3) where it matters
-            # Testing significance on TRAINING data is meaningless - we already know it's profitable
-            per_round_returns = train_result.get('per_round_returns', [])
-            p_value = 0.0  # Will be calculated on holdout
+            # Memory management
+            gc.collect()
+            if combo_idx % 200 == 0:
+                check_memory_usage(f"combo_{combo_idx}")
 
-            csv_row['is_significant'] = True  # Deferred to holdout phase
-            csv_row['p_value'] = p_value
-            csv_writer.writerow(csv_row)
-
-            # Validate total P&L positive across folds (use crossfold sample rate for speed)
-            crossfold_rate = max(1, thoroughness.sample_rate // thoroughness.crossfold_divisor)
-            total_pnl_positive, fold_pnls, avg_val_pnl = validate_across_all_folds(
-                params, prices, folds, funding_rates, sample_rate=crossfold_rate
-            )
-
-            # Save to storage
-            rounds_data = []
-            for r in train_result.get('rounds', []):
-                rounds_data.append({
-                    'timestamp': str(getattr(r, 'entry_time', '')),
-                    'pnl_pct': getattr(r, 'total_pnl', 0),
-                    'duration_sec': 0,
-                    'num_pyramids': getattr(r, 'num_pyramids', 0),
-                })
-
-            summary = {
-                'total_pnl': train_result.get('total_pnl', 0),
-                'total_rounds': train_result.get('total_rounds', 0),
-                'win_rate': train_result.get('win_rate', 0),
-            }
-
-            storage.save_combo_result(params, rounds_data, summary)
-
-            # Calculate Sharpe
-            try:
-                sharpe = calculate_real_sharpe(storage, params)
-            except ValueError:
-                sharpe = 0.0
-
-            # Record passed combo
-            result = OptimizationResult(
-                params=params,
-                train_metrics={
-                    'total_pnl': train_result.get('total_pnl', 0),
-                    'win_rate': train_result.get('win_rate', 0),
-                    'total_rounds': train_result.get('total_rounds', 0),
-                    'max_drawdown_pct': train_result.get('max_drawdown_pct', 0),
-                },
-                val_metrics={
-                    'total_pnl': val_result.get('total_pnl', 0),
-                    'win_rate': val_result.get('win_rate', 0),
-                    'total_rounds': val_result.get('total_rounds', 0),
-                },
-                holdout_metrics=None,
-                passed_gate=True,
-                is_significant=False,  # v7.1: Set in holdout phase, not here
-                p_value=1.0,           # v7.1: Calculated on holdout data
-                sharpe=sharpe,
-                per_round_returns=per_round_returns,
-                fold_pnls=fold_pnls,
-                total_pnl_positive=total_pnl_positive,
-                avg_val_pnl=avg_val_pnl,
-            )
-            passed_combos.append(result)
-
-            # Track combo time for ETA calculation
-            combo_time = time_module.time() - combo_start
-            combo_times.append(combo_time)
-            # Prevent memory leak - keep only last 50 times for ETA
-            if len(combo_times) > 100:
-                combo_times = combo_times[-50:]
-
-        # Memory management
-        gc.collect()
-        if combo_idx % 200 == 0:
-            check_memory_usage(f"combo_{combo_idx}")
+        print()  # New line after progress bar
 
     csv_f.close()
     print(f"\nCSV log saved to: {csv_file}")
@@ -1418,6 +1802,13 @@ def main():
         default=None,
         help="(Advanced) Override sample rate. Use --thoroughness instead."
     )
+    parser.add_argument(
+        "--workers", "-w",
+        type=int,
+        default=None,
+        help="Number of worker processes for parallel execution. "
+             "Default: auto-detect (CPU cores - 1). Use 0 to force sequential mode."
+    )
 
     args = parser.parse_args()
 
@@ -1451,7 +1842,8 @@ def main():
         output_dir=args.output,
         batch_size=args.batch_size,
         verbose=not args.quiet,
-        thoroughness=thoroughness
+        thoroughness=thoroughness,
+        workers=args.workers
     )
 
     print()
