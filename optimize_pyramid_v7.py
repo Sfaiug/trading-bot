@@ -4,6 +4,7 @@ Pure Profit Pyramid Strategy Optimizer (v7.7)
 
 v7.7 NEW:
 - CLI options for --capital, --leverage, --position-size
+- Relaxed robustness score: 60% → 40% (accept sharper parameter peaks)
 - Relaxed regime threshold: 40% → 20% (allows specialized trend strategies)
 - Relaxed 5th percentile P&L: -15% → -25% (accept bigger dips for bigger wins)
 - Relaxed P(ruin): 5% → 10% (higher risk tolerance for trend-catching)
@@ -247,7 +248,7 @@ MIN_HOLDOUT_ROUNDS = 30  # Need some rounds for statistical validity
 # - NO MIN_WIN_LOSS_RATIO
 
 # Robustness testing (keep this - it's not arbitrary, it's statistical)
-MIN_ROBUSTNESS_SCORE = 0.6  # Nearby params must give at least 60% of best P&L
+MIN_ROBUSTNESS_SCORE = 0.4  # v7.7: Relaxed from 0.6 - accept sharper peaks for trend strategies
 
 # Family-wise error rate for Bonferroni
 FAMILY_ALPHA = 0.05
