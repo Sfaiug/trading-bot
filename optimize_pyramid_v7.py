@@ -266,26 +266,43 @@ def get_worker_count(requested: Optional[int] = None) -> int:
     return max(1, (os.cpu_count() or 4) - 1)
 
 
-# Worker process globals (set by init_worker, used by process_single_combo)
+# Worker process globals (set by init_worker, used by worker functions)
 _worker_prices = None
 _worker_prices_file = None
 _worker_meta = None
 _worker_folds = None
 _worker_funding = None
 _worker_thoroughness = None
+# Phase 2-5 worker globals (set lazily via set_worker_holdout_data)
+_worker_holdout_prices = None
+_worker_train_val_prices = None
+_worker_holdout_start_pct = None
+_worker_symbol = None
 
 
 def init_worker(prices_file: str, meta: Dict, folds: List[Dict],
-                funding_rates: Dict, thoroughness_dict: Dict) -> None:
+                funding_rates: Dict, thoroughness_dict: Dict,
+                holdout_dict: Dict = None, symbol: str = None) -> None:
     """
     Initialize worker process globals.
 
     Called once per worker by Pool. Re-opens memmap in worker process
     for cross-platform safety. On fork-based systems (macOS/Linux),
     this shares physical memory pages via copy-on-write.
+
+    Args:
+        prices_file: Path to memmap file
+        meta: Memmap metadata dict
+        folds: List of fold configurations
+        funding_rates: Funding rate dict
+        thoroughness_dict: ThoroughnessConfig as dict
+        holdout_dict: Holdout configuration for Phases 2-5 (optional)
+        symbol: Trading symbol for slippage estimation (optional)
     """
     global _worker_prices, _worker_prices_file, _worker_meta
     global _worker_folds, _worker_funding, _worker_thoroughness
+    global _worker_holdout_prices, _worker_train_val_prices
+    global _worker_holdout_start_pct, _worker_symbol
 
     from core.memmap_prices import load_prices_memmap
 
@@ -294,9 +311,21 @@ def init_worker(prices_file: str, meta: Dict, folds: List[Dict],
     _worker_folds = folds
     _worker_funding = funding_rates
     _worker_thoroughness = ThoroughnessConfig(**thoroughness_dict)
+    _worker_symbol = symbol
 
     # Re-open memmap in worker (shares pages via COW on fork)
     _worker_prices = load_prices_memmap(prices_file, meta)
+
+    # Set up holdout slices for Phases 2-5 (if holdout info provided)
+    if holdout_dict is not None:
+        _worker_holdout_start_pct = holdout_dict.get('start_pct', 0.85)
+        non_holdout_end = int(len(_worker_prices) * _worker_holdout_start_pct)
+        _worker_train_val_prices = _worker_prices[:non_holdout_end]
+        _worker_holdout_prices = slice_prices_for_holdout(_worker_prices, holdout_dict)
+    else:
+        _worker_holdout_start_pct = None
+        _worker_train_val_prices = None
+        _worker_holdout_prices = None
 
 
 def process_single_combo(args: Tuple[int, Dict]) -> Optional[Dict]:
@@ -434,6 +463,191 @@ def process_single_combo(args: Tuple[int, Dict]) -> Optional[Dict]:
                 'is_significant': False,
                 'p_value': 1.0,
             },
+        }
+
+
+# =============================================================================
+# PHASE 2-5 WORKER FUNCTIONS (Parallel execution)
+# =============================================================================
+
+def process_robustness_combo(args: Tuple[int, Dict, int]) -> Dict:
+    """
+    Worker: Calculate robustness score for one combo (Phase 2).
+
+    Args:
+        args: Tuple of (idx, params, sample_rate)
+
+    Returns:
+        Dict with idx and robustness score.
+    """
+    idx, params, sample_rate = args
+
+    try:
+        robustness, perturbations = calculate_robustness_score(
+            params, _worker_train_val_prices, _worker_funding,
+            sample_rate=sample_rate
+        )
+        return {'idx': idx, 'robustness': robustness, 'error': None}
+    except Exception as e:
+        return {'idx': idx, 'robustness': 0.0, 'error': str(e)}
+
+
+def process_holdout_combo(args: Tuple[int, Dict, int, int, float]) -> Dict:
+    """
+    Worker: Run holdout backtest + Bonferroni significance (Phase 3).
+
+    Args:
+        args: Tuple of (idx, params, sample_rate, n_tests, family_alpha)
+
+    Returns:
+        Dict with holdout metrics, significance, and adjusted P&L.
+    """
+    idx, params, sample_rate, n_tests, family_alpha = args
+
+    try:
+        holdout_result = run_backtest_with_params(
+            params, _worker_holdout_prices, _worker_funding,
+            sample_rate=sample_rate
+        )
+
+        holdout_pnl = holdout_result.get('total_pnl', 0)
+        holdout_rounds = holdout_result.get('total_rounds', 0)
+
+        # Apply slippage cost estimate
+        num_pyramids = holdout_result.get('avg_pyramids', 5)
+        slippage_pct = estimate_round_slippage_pct(
+            num_pyramids=int(num_pyramids),
+            position_size_usdt=POSITION_SIZE_USDT,
+            symbol=_worker_symbol or 'BTCUSDT'
+        )
+        total_slippage = slippage_pct * holdout_rounds
+        adjusted_pnl = holdout_pnl - total_slippage
+
+        # Build holdout metrics
+        holdout_metrics = {
+            'total_pnl': holdout_pnl,
+            'adjusted_pnl': adjusted_pnl,
+            'slippage_pct': total_slippage,
+            'win_rate': holdout_result.get('win_rate', 0),
+            'total_rounds': holdout_rounds,
+            'max_drawdown_pct': holdout_result.get('max_drawdown_pct', 0),
+        }
+
+        # Bonferroni significance test on holdout returns
+        holdout_returns = holdout_result.get('per_round_returns', [])
+        if len(holdout_returns) >= 10:
+            is_significant, p_value, _ = check_bonferroni_significance(
+                params, holdout_returns, n_tests, family_alpha
+            )
+        else:
+            is_significant = False
+            p_value = 1.0
+
+        return {
+            'idx': idx,
+            'holdout_metrics': holdout_metrics,
+            'is_significant': is_significant,
+            'p_value': p_value,
+            'adjusted_pnl': adjusted_pnl,
+            'holdout_rounds': holdout_rounds,
+            'error': None,
+        }
+    except Exception as e:
+        return {
+            'idx': idx,
+            'holdout_metrics': None,
+            'is_significant': False,
+            'p_value': 1.0,
+            'adjusted_pnl': 0,
+            'holdout_rounds': 0,
+            'error': str(e),
+        }
+
+
+def process_regime_combo(args: Tuple[int, Dict]) -> Dict:
+    """
+    Worker: Validate regime robustness for one combo (Phase 4).
+
+    Args:
+        args: Tuple of (idx, params)
+
+    Returns:
+        Dict with idx and regime_pass boolean.
+    """
+    idx, params = args
+
+    try:
+        regime_pass = validate_regime_robustness(
+            params, _worker_holdout_prices, _worker_funding
+        )
+        return {'idx': idx, 'regime_pass': regime_pass, 'error': None}
+    except Exception as e:
+        return {'idx': idx, 'regime_pass': False, 'error': str(e)}
+
+
+def process_monte_carlo_combo(args: Tuple[int, Dict, int, int, int]) -> Dict:
+    """
+    Worker: Run Monte Carlo validation for one combo (Phase 5).
+
+    Args:
+        args: Tuple of (idx, params, sample_rate, mc_bootstrap, mc_permutation)
+
+    Returns:
+        Dict with Monte Carlo validation results.
+    """
+    idx, params, sample_rate, mc_bootstrap, mc_permutation = args
+
+    try:
+        from core.monte_carlo import run_monte_carlo_validation
+
+        # Run holdout backtest
+        holdout_result = run_backtest_with_params(
+            params, _worker_holdout_prices, _worker_funding,
+            sample_rate=sample_rate
+        )
+        holdout_returns = holdout_result.get('per_round_returns', [])
+
+        if len(holdout_returns) < 10:
+            return {
+                'idx': idx,
+                'mc_passes': False,
+                'mc_prob_positive': 0,
+                'mc_prob_ruin': 1,
+                'mc_sharpe_5th': 0,
+                'mc_sequence_matters': True,
+                'holdout_pnl': holdout_result.get('total_pnl', 0),
+                'error': 'Insufficient rounds (<10)',
+            }
+
+        # Run Monte Carlo validation
+        passes, mc_result, perm_result = run_monte_carlo_validation(
+            round_returns=holdout_returns,
+            n_bootstrap=mc_bootstrap,
+            n_permutation=mc_permutation,
+            ruin_threshold=0.50,
+            random_seed=42 + idx  # Different seed per combo
+        )
+
+        return {
+            'idx': idx,
+            'mc_passes': passes,
+            'mc_prob_positive': mc_result.probability_positive,
+            'mc_prob_ruin': mc_result.probability_ruin,
+            'mc_sharpe_5th': mc_result.sharpe_5th_percentile,
+            'mc_sequence_matters': perm_result.sequence_matters,
+            'holdout_pnl': holdout_result.get('total_pnl', 0),
+            'error': None,
+        }
+    except Exception as e:
+        return {
+            'idx': idx,
+            'mc_passes': False,
+            'mc_prob_positive': 0,
+            'mc_prob_ruin': 1,
+            'mc_sharpe_5th': 0,
+            'mc_sequence_matters': True,
+            'holdout_pnl': 0,
+            'error': str(e),
         }
 
 
@@ -587,6 +801,372 @@ def run_parallel_grid_search(
 
     print()  # New line after progress bar
     return passed_combos, failed_gate, errors
+
+
+# =============================================================================
+# PHASE 2-5 PARALLEL WRAPPERS
+# =============================================================================
+
+def run_parallel_robustness(
+    results: List,
+    prices_file: str,
+    meta: Dict,
+    folds: List[Dict],
+    holdout: Dict,
+    funding_rates: Dict,
+    thoroughness: ThoroughnessConfig,
+    n_workers: int,
+    symbol: str,
+    verbose: bool = True
+) -> None:
+    """
+    Run Phase 2 robustness testing in parallel.
+
+    Updates results in-place with robustness_score.
+    """
+    import time as time_module
+
+    n_items = min(30, len(results))
+    if n_items == 0:
+        return
+
+    robustness_sample_rate = max(1, thoroughness.sample_rate // thoroughness.robustness_divisor)
+
+    # Prepare work items: (idx, params, sample_rate)
+    work_items = [
+        (i, results[i].params, robustness_sample_rate)
+        for i in range(n_items)
+    ]
+
+    thoroughness_dict = {
+        'name': thoroughness.name,
+        'sample_rate': thoroughness.sample_rate,
+        'crossfold_divisor': thoroughness.crossfold_divisor,
+        'robustness_divisor': thoroughness.robustness_divisor,
+        'holdout_sample_rate': thoroughness.holdout_sample_rate,
+        'mc_bootstrap': thoroughness.mc_bootstrap,
+        'mc_permutation': thoroughness.mc_permutation,
+        'estimated_time': thoroughness.estimated_time,
+    }
+
+    holdout_dict = {
+        'start_pct': holdout.get('start_pct', 0.85),
+        'end_pct': holdout.get('end_pct', 1.0),
+    }
+
+    print(f"  Running parallel robustness with {n_workers} workers...")
+    start_time = time_module.time()
+
+    original_sigint = signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+    try:
+        pool = Pool(
+            processes=n_workers,
+            initializer=init_worker,
+            initargs=(prices_file, meta, folds, funding_rates, thoroughness_dict,
+                      holdout_dict, symbol)
+        )
+        signal.signal(signal.SIGINT, original_sigint)
+
+        completed = 0
+        for result in pool.imap_unordered(process_robustness_combo, work_items, chunksize=5):
+            completed += 1
+            idx = result['idx']
+            results[idx].robustness_score = result['robustness']
+
+            # Print status
+            robustness = result['robustness']
+            params = results[idx].params
+            if robustness < MIN_ROBUSTNESS_SCORE:
+                print(f"  [FRAGILE] th={params['threshold']}, tr={params['trailing']}: robustness={robustness:.2f}")
+            else:
+                print(f"  [ROBUST]  th={params['threshold']}, tr={params['trailing']}: robustness={robustness:.2f}")
+
+        pool.close()
+        pool.join()
+
+    except KeyboardInterrupt:
+        print("\n\nShutdown requested. Terminating workers...")
+        pool.terminate()
+        pool.join()
+        raise
+
+    elapsed = time_module.time() - start_time
+    if verbose:
+        print(f"  Robustness phase completed in {elapsed:.1f}s")
+
+
+def run_parallel_holdout(
+    results: List,
+    prices_file: str,
+    meta: Dict,
+    folds: List[Dict],
+    holdout: Dict,
+    funding_rates: Dict,
+    thoroughness: ThoroughnessConfig,
+    n_workers: int,
+    symbol: str,
+    verbose: bool = True
+) -> List:
+    """
+    Run Phase 3 holdout evaluation in parallel.
+
+    Returns list of results that pass holdout requirements.
+    """
+    import time as time_module
+
+    n_items = min(100, len(results))
+    if n_items == 0:
+        return []
+
+    n_holdout_tests = n_items
+    holdout_bonferroni_alpha = FAMILY_ALPHA / n_holdout_tests if n_holdout_tests > 0 else FAMILY_ALPHA
+
+    # Prepare work items: (idx, params, sample_rate, n_tests, family_alpha)
+    work_items = [
+        (i, results[i].params, thoroughness.holdout_sample_rate,
+         n_holdout_tests, FAMILY_ALPHA)
+        for i in range(n_items)
+    ]
+
+    thoroughness_dict = {
+        'name': thoroughness.name,
+        'sample_rate': thoroughness.sample_rate,
+        'crossfold_divisor': thoroughness.crossfold_divisor,
+        'robustness_divisor': thoroughness.robustness_divisor,
+        'holdout_sample_rate': thoroughness.holdout_sample_rate,
+        'mc_bootstrap': thoroughness.mc_bootstrap,
+        'mc_permutation': thoroughness.mc_permutation,
+        'estimated_time': thoroughness.estimated_time,
+    }
+
+    holdout_dict = {
+        'start_pct': holdout.get('start_pct', 0.85),
+        'end_pct': holdout.get('end_pct', 1.0),
+    }
+
+    print(f"  Running parallel holdout with {n_workers} workers...")
+    start_time = time_module.time()
+
+    original_sigint = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    holdout_candidates = []
+
+    try:
+        pool = Pool(
+            processes=n_workers,
+            initializer=init_worker,
+            initargs=(prices_file, meta, folds, funding_rates, thoroughness_dict,
+                      holdout_dict, symbol)
+        )
+        signal.signal(signal.SIGINT, original_sigint)
+
+        for result_data in pool.imap_unordered(process_holdout_combo, work_items, chunksize=10):
+            idx = result_data['idx']
+            result = results[idx]
+
+            if result_data['holdout_metrics'] is not None:
+                result.holdout_metrics = result_data['holdout_metrics']
+                result.is_significant = result_data['is_significant']
+                result.p_value = result_data['p_value']
+
+                adjusted_pnl = result_data['adjusted_pnl']
+                holdout_rounds = result_data['holdout_rounds']
+
+                # Check requirements
+                if (adjusted_pnl >= MIN_HOLDOUT_PNL and
+                    holdout_rounds >= MIN_HOLDOUT_ROUNDS and
+                    result.is_significant):
+                    holdout_candidates.append(result)
+
+        pool.close()
+        pool.join()
+
+    except KeyboardInterrupt:
+        print("\n\nShutdown requested. Terminating workers...")
+        pool.terminate()
+        pool.join()
+        raise
+
+    elapsed = time_module.time() - start_time
+    if verbose:
+        print(f"  Holdout phase completed in {elapsed:.1f}s")
+
+    # Sort by adjusted holdout P&L
+    holdout_candidates.sort(key=lambda x: x.holdout_metrics['adjusted_pnl'], reverse=True)
+    return holdout_candidates
+
+
+def run_parallel_regime(
+    results: List,
+    prices_file: str,
+    meta: Dict,
+    folds: List[Dict],
+    holdout: Dict,
+    funding_rates: Dict,
+    thoroughness: ThoroughnessConfig,
+    n_workers: int,
+    symbol: str,
+    verbose: bool = True
+) -> None:
+    """
+    Run Phase 4 regime validation in parallel.
+
+    Updates results in-place with regime_pass.
+    """
+    import time as time_module
+
+    n_items = min(10, len(results))
+    if n_items == 0:
+        return
+
+    # Prepare work items: (idx, params)
+    work_items = [(i, results[i].params) for i in range(n_items)]
+
+    thoroughness_dict = {
+        'name': thoroughness.name,
+        'sample_rate': thoroughness.sample_rate,
+        'crossfold_divisor': thoroughness.crossfold_divisor,
+        'robustness_divisor': thoroughness.robustness_divisor,
+        'holdout_sample_rate': thoroughness.holdout_sample_rate,
+        'mc_bootstrap': thoroughness.mc_bootstrap,
+        'mc_permutation': thoroughness.mc_permutation,
+        'estimated_time': thoroughness.estimated_time,
+    }
+
+    holdout_dict = {
+        'start_pct': holdout.get('start_pct', 0.85),
+        'end_pct': holdout.get('end_pct', 1.0),
+    }
+
+    print(f"  Running parallel regime validation with {n_workers} workers...")
+    start_time = time_module.time()
+
+    original_sigint = signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+    try:
+        pool = Pool(
+            processes=n_workers,
+            initializer=init_worker,
+            initargs=(prices_file, meta, folds, funding_rates, thoroughness_dict,
+                      holdout_dict, symbol)
+        )
+        signal.signal(signal.SIGINT, original_sigint)
+
+        for result_data in pool.imap_unordered(process_regime_combo, work_items, chunksize=2):
+            idx = result_data['idx']
+            results[idx].regime_pass = result_data['regime_pass']
+            status = "[PASS]" if result_data['regime_pass'] else "[FAIL]"
+            params = results[idx].params
+            print(f"  {status} th={params['threshold']}, tr={params['trailing']}")
+
+        pool.close()
+        pool.join()
+
+    except KeyboardInterrupt:
+        print("\n\nShutdown requested. Terminating workers...")
+        pool.terminate()
+        pool.join()
+        raise
+
+    elapsed = time_module.time() - start_time
+    if verbose:
+        print(f"  Regime phase completed in {elapsed:.1f}s")
+
+
+def run_parallel_monte_carlo(
+    results: List,
+    prices_file: str,
+    meta: Dict,
+    folds: List[Dict],
+    holdout: Dict,
+    funding_rates: Dict,
+    thoroughness: ThoroughnessConfig,
+    n_workers: int,
+    symbol: str,
+    verbose: bool = True
+) -> List:
+    """
+    Run Phase 5 Monte Carlo validation in parallel.
+
+    Returns list of results that pass Monte Carlo validation.
+    """
+    import time as time_module
+
+    n_items = min(30, len(results))
+    if n_items == 0:
+        return []
+
+    # Prepare work items: (idx, params, sample_rate, mc_bootstrap, mc_permutation)
+    work_items = [
+        (i, results[i].params, thoroughness.holdout_sample_rate,
+         thoroughness.mc_bootstrap, thoroughness.mc_permutation)
+        for i in range(n_items)
+    ]
+
+    thoroughness_dict = {
+        'name': thoroughness.name,
+        'sample_rate': thoroughness.sample_rate,
+        'crossfold_divisor': thoroughness.crossfold_divisor,
+        'robustness_divisor': thoroughness.robustness_divisor,
+        'holdout_sample_rate': thoroughness.holdout_sample_rate,
+        'mc_bootstrap': thoroughness.mc_bootstrap,
+        'mc_permutation': thoroughness.mc_permutation,
+        'estimated_time': thoroughness.estimated_time,
+    }
+
+    holdout_dict = {
+        'start_pct': holdout.get('start_pct', 0.85),
+        'end_pct': holdout.get('end_pct', 1.0),
+    }
+
+    print(f"  Running parallel Monte Carlo with {n_workers} workers...")
+    start_time = time_module.time()
+
+    original_sigint = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    mc_validated = []
+
+    try:
+        pool = Pool(
+            processes=n_workers,
+            initializer=init_worker,
+            initargs=(prices_file, meta, folds, funding_rates, thoroughness_dict,
+                      holdout_dict, symbol)
+        )
+        signal.signal(signal.SIGINT, original_sigint)
+
+        for result_data in pool.imap_unordered(process_monte_carlo_combo, work_items, chunksize=5):
+            idx = result_data['idx']
+            result = results[idx]
+
+            result.mc_passes = result_data['mc_passes']
+            result.mc_prob_positive = result_data['mc_prob_positive']
+            result.mc_prob_ruin = result_data['mc_prob_ruin']
+            result.mc_sharpe_5th = result_data['mc_sharpe_5th']
+            result.mc_sequence_matters = result_data['mc_sequence_matters']
+
+            params = result.params
+            if result_data['mc_passes']:
+                mc_validated.append(result)
+                print(f"  [PASS] th={params['threshold']}, tr={params['trailing']}, "
+                      f"P(+)={result_data['mc_prob_positive']:.1%}, "
+                      f"Holdout P&L={result_data['holdout_pnl']:.1f}%")
+            else:
+                print(f"  [FAIL] th={params['threshold']}, tr={params['trailing']}")
+
+        pool.close()
+        pool.join()
+
+    except KeyboardInterrupt:
+        print("\n\nShutdown requested. Terminating workers...")
+        pool.terminate()
+        pool.join()
+        raise
+
+    elapsed = time_module.time() - start_time
+    if verbose:
+        print(f"  Monte Carlo phase completed in {elapsed:.1f}s")
+
+    return mc_validated
 
 
 # =============================================================================
@@ -980,7 +1560,7 @@ def run_optimization(
     n_workers = get_worker_count(workers)
 
     print("=" * 70)
-    print("PURE PROFIT OPTIMIZER v7.3 - 'Whatever Works'")
+    print("PURE PROFIT OPTIMIZER v7.4 - 'Maximum Parallelization'")
     print("=" * 70)
     print(f"Symbol: {symbol}")
     print(f"Days: {days}")
@@ -1282,18 +1862,33 @@ def run_optimization(
     print(f"  Using {non_holdout_end:,} prices (0-{holdout_start_pct*100:.0f}%) for robustness testing")
     print(f"  (Holdout {holdout_start_pct*100:.0f}-100% is excluded to prevent data leakage)")
 
-    # Use lighter sampling for robustness (fewer combos to test)
-    robustness_sample_rate = max(1, thoroughness.sample_rate // thoroughness.robustness_divisor)
-    for result in working_results[:30]:
-        robustness, perturbations = calculate_robustness_score(
-            result.params, train_val_prices, funding_rates, sample_rate=robustness_sample_rate
+    if n_workers > 0:
+        # Parallel robustness testing
+        run_parallel_robustness(
+            results=working_results,
+            prices_file=prices_file,
+            meta=meta,
+            folds=folds,
+            holdout=holdout,
+            funding_rates=funding_rates,
+            thoroughness=thoroughness,
+            n_workers=n_workers,
+            symbol=symbol,
+            verbose=verbose
         )
-        result.robustness_score = robustness
+    else:
+        # Sequential robustness testing
+        robustness_sample_rate = max(1, thoroughness.sample_rate // thoroughness.robustness_divisor)
+        for result in working_results[:30]:
+            robustness, perturbations = calculate_robustness_score(
+                result.params, train_val_prices, funding_rates, sample_rate=robustness_sample_rate
+            )
+            result.robustness_score = robustness
 
-        if robustness < MIN_ROBUSTNESS_SCORE:
-            print(f"  [FRAGILE] th={result.params['threshold']}, tr={result.params['trailing']}: robustness={robustness:.2f}")
-        else:
-            print(f"  [ROBUST]  th={result.params['threshold']}, tr={result.params['trailing']}: robustness={robustness:.2f}")
+            if robustness < MIN_ROBUSTNESS_SCORE:
+                print(f"  [FRAGILE] th={result.params['threshold']}, tr={result.params['trailing']}: robustness={robustness:.2f}")
+            else:
+                print(f"  [ROBUST]  th={result.params['threshold']}, tr={result.params['trailing']}: robustness={robustness:.2f}")
 
     # Filter by robustness (keep this - it's not arbitrary)
     robust_results = [r for r in working_results if r.robustness_score >= MIN_ROBUSTNESS_SCORE]
@@ -1313,7 +1908,6 @@ def run_optimization(
     print()
 
     holdout_prices = slice_prices_for_holdout(prices, holdout)
-    holdout_candidates = []
     n_holdout_tests = min(100, len(working_results))  # Number of holdout tests for Bonferroni
     holdout_bonferroni_alpha = FAMILY_ALPHA / n_holdout_tests if n_holdout_tests > 0 else FAMILY_ALPHA
     print(f"  Testing {n_holdout_tests} combos on holdout")
@@ -1324,53 +1918,71 @@ def run_optimization(
         print(f"  Using 1/{thoroughness.holdout_sample_rate} data for holdout ({thoroughness.name} mode)")
     print()
 
-    for result in working_results[:100]:  # Test top 100
-        # Holdout validation - sample rate depends on thoroughness level
-        holdout_result = run_backtest_with_params(result.params, holdout_prices, funding_rates, sample_rate=thoroughness.holdout_sample_rate)
-
-        holdout_pnl = holdout_result.get('total_pnl', 0)
-        holdout_rounds = holdout_result.get('total_rounds', 0)
-
-        # v7.1 FIX: Apply slippage cost estimate to holdout P&L
-        num_pyramids = holdout_result.get('avg_pyramids', 5)  # Estimate avg pyramids
-        slippage_pct = estimate_round_slippage_pct(
-            num_pyramids=int(num_pyramids),
-            position_size_usdt=POSITION_SIZE_USDT,
-            symbol=symbol
+    if n_workers > 0:
+        # Parallel holdout evaluation
+        holdout_candidates = run_parallel_holdout(
+            results=working_results,
+            prices_file=prices_file,
+            meta=meta,
+            folds=folds,
+            holdout=holdout,
+            funding_rates=funding_rates,
+            thoroughness=thoroughness,
+            n_workers=n_workers,
+            symbol=symbol,
+            verbose=verbose
         )
-        # Apply slippage penalty per round
-        total_slippage = slippage_pct * holdout_rounds
-        adjusted_pnl = holdout_pnl - total_slippage
+    else:
+        # Sequential holdout evaluation
+        holdout_candidates = []
+        for result in working_results[:100]:  # Test top 100
+            # Holdout validation - sample rate depends on thoroughness level
+            holdout_result = run_backtest_with_params(result.params, holdout_prices, funding_rates, sample_rate=thoroughness.holdout_sample_rate)
 
-        result.holdout_metrics = {
-            'total_pnl': holdout_pnl,
-            'adjusted_pnl': adjusted_pnl,  # After slippage
-            'slippage_pct': total_slippage,
-            'win_rate': holdout_result.get('win_rate', 0),
-            'total_rounds': holdout_rounds,
-            'max_drawdown_pct': holdout_result.get('max_drawdown_pct', 0),
-        }
+            holdout_pnl = holdout_result.get('total_pnl', 0)
+            holdout_rounds = holdout_result.get('total_rounds', 0)
 
-        # v7.1 FIX: Apply Bonferroni significance test on HOLDOUT returns
-        holdout_returns = holdout_result.get('per_round_returns', [])
-        if len(holdout_returns) >= 10:  # Need enough rounds
-            is_significant, p_value, _ = check_bonferroni_significance(
-                result.params, holdout_returns, n_holdout_tests, FAMILY_ALPHA
+            # v7.1 FIX: Apply slippage cost estimate to holdout P&L
+            num_pyramids = holdout_result.get('avg_pyramids', 5)  # Estimate avg pyramids
+            slippage_pct = estimate_round_slippage_pct(
+                num_pyramids=int(num_pyramids),
+                position_size_usdt=POSITION_SIZE_USDT,
+                symbol=symbol
             )
-            result.is_significant = is_significant
-            result.p_value = p_value
-        else:
-            result.is_significant = False
-            result.p_value = 1.0
+            # Apply slippage penalty per round
+            total_slippage = slippage_pct * holdout_rounds
+            adjusted_pnl = holdout_pnl - total_slippage
 
-        # REQUIREMENTS: profitable (after slippage), enough rounds, statistically significant
-        if (adjusted_pnl >= MIN_HOLDOUT_PNL and
-            holdout_rounds >= MIN_HOLDOUT_ROUNDS and
-            result.is_significant):
-            holdout_candidates.append(result)
+            result.holdout_metrics = {
+                'total_pnl': holdout_pnl,
+                'adjusted_pnl': adjusted_pnl,  # After slippage
+                'slippage_pct': total_slippage,
+                'win_rate': holdout_result.get('win_rate', 0),
+                'total_rounds': holdout_rounds,
+                'max_drawdown_pct': holdout_result.get('max_drawdown_pct', 0),
+            }
 
-    # PURE PROFIT RANKING - sort by adjusted holdout P&L (after slippage)
-    holdout_candidates.sort(key=lambda x: x.holdout_metrics['adjusted_pnl'], reverse=True)
+            # v7.1 FIX: Apply Bonferroni significance test on HOLDOUT returns
+            holdout_returns = holdout_result.get('per_round_returns', [])
+            if len(holdout_returns) >= 10:  # Need enough rounds
+                is_significant, p_value, _ = check_bonferroni_significance(
+                    result.params, holdout_returns, n_holdout_tests, FAMILY_ALPHA
+                )
+                result.is_significant = is_significant
+                result.p_value = p_value
+            else:
+                result.is_significant = False
+                result.p_value = 1.0
+
+            # REQUIREMENTS: profitable (after slippage), enough rounds, statistically significant
+            if (adjusted_pnl >= MIN_HOLDOUT_PNL and
+                holdout_rounds >= MIN_HOLDOUT_ROUNDS and
+                result.is_significant):
+                holdout_candidates.append(result)
+
+        # PURE PROFIT RANKING - sort by adjusted holdout P&L (after slippage)
+        holdout_candidates.sort(key=lambda x: x.holdout_metrics['adjusted_pnl'], reverse=True)
+
     final_results = holdout_candidates
     print(f"{len(final_results)} combos pass holdout requirements:")
     print(f"  - Positive adjusted P&L (after slippage)")
@@ -1389,12 +2001,28 @@ def run_optimization(
     print("PHASE 4: REGIME VALIDATION")
     print("=" * 70)
 
-    for result in final_results[:10]:
-        result.regime_pass = validate_regime_robustness(
-            result.params, holdout_prices, funding_rates
+    if n_workers > 0 and final_results:
+        # Parallel regime validation
+        run_parallel_regime(
+            results=final_results,
+            prices_file=prices_file,
+            meta=meta,
+            folds=folds,
+            holdout=holdout,
+            funding_rates=funding_rates,
+            thoroughness=thoroughness,
+            n_workers=n_workers,
+            symbol=symbol,
+            verbose=verbose
         )
-        status = "[PASS]" if result.regime_pass else "[FAIL]"
-        print(f"  {status} th={result.params['threshold']}, tr={result.params['trailing']}")
+    else:
+        # Sequential regime validation
+        for result in final_results[:10]:
+            result.regime_pass = validate_regime_robustness(
+                result.params, holdout_prices, funding_rates
+            )
+            status = "[PASS]" if result.regime_pass else "[FAIL]"
+            print(f"  {status} th={result.params['threshold']}, tr={result.params['trailing']}")
 
     # PHASE 5: Monte Carlo validation (statistical validity)
     print()
@@ -1403,47 +2031,69 @@ def run_optimization(
     print("=" * 70)
 
     if final_results:
-        try:
-            from core.monte_carlo import run_monte_carlo_validation, format_monte_carlo_report
-
-            mc_validated = []
-            for result in final_results[:30]:
-                # Use holdout sample rate for Monte Carlo backtest
-                holdout_result = run_backtest_with_params(result.params, holdout_prices, funding_rates, sample_rate=thoroughness.holdout_sample_rate)
-                holdout_returns = holdout_result.get('per_round_returns', [])
-
-                if len(holdout_returns) < 10:
-                    continue
-
-                passes, mc_result, perm_result = run_monte_carlo_validation(
-                    round_returns=holdout_returns,
-                    n_bootstrap=thoroughness.mc_bootstrap,
-                    n_permutation=thoroughness.mc_permutation,
-                    ruin_threshold=0.50,  # Generous - we don't limit drawdown
-                    random_seed=42
+        if n_workers > 0:
+            # Parallel Monte Carlo validation
+            try:
+                mc_validated = run_parallel_monte_carlo(
+                    results=final_results,
+                    prices_file=prices_file,
+                    meta=meta,
+                    folds=folds,
+                    holdout=holdout,
+                    funding_rates=funding_rates,
+                    thoroughness=thoroughness,
+                    n_workers=n_workers,
+                    symbol=symbol,
+                    verbose=verbose
                 )
+                print(f"\n{len(mc_validated)} combos passed Monte Carlo")
+                if mc_validated:
+                    final_results = mc_validated
+            except Exception as e:
+                print(f"  Monte Carlo parallel execution failed: {e}")
+        else:
+            # Sequential Monte Carlo validation
+            try:
+                from core.monte_carlo import run_monte_carlo_validation, format_monte_carlo_report
 
-                result.mc_passes = passes
-                result.mc_prob_positive = mc_result.probability_positive
-                result.mc_prob_ruin = mc_result.probability_ruin
-                result.mc_sharpe_5th = mc_result.sharpe_5th_percentile
-                result.mc_sequence_matters = perm_result.sequence_matters
+                mc_validated = []
+                for result in final_results[:30]:
+                    # Use holdout sample rate for Monte Carlo backtest
+                    holdout_result = run_backtest_with_params(result.params, holdout_prices, funding_rates, sample_rate=thoroughness.holdout_sample_rate)
+                    holdout_returns = holdout_result.get('per_round_returns', [])
 
-                if passes:
-                    mc_validated.append(result)
-                    print(f"  [PASS] th={result.params['threshold']}, tr={result.params['trailing']}, "
-                          f"P(+)={mc_result.probability_positive:.1%}, "
-                          f"Holdout P&L={result.holdout_metrics['total_pnl']:.1f}%")
-                else:
-                    print(f"  [FAIL] th={result.params['threshold']}, tr={result.params['trailing']}")
+                    if len(holdout_returns) < 10:
+                        continue
 
-            print(f"\n{len(mc_validated)} combos passed Monte Carlo")
+                    passes, mc_result, perm_result = run_monte_carlo_validation(
+                        round_returns=holdout_returns,
+                        n_bootstrap=thoroughness.mc_bootstrap,
+                        n_permutation=thoroughness.mc_permutation,
+                        ruin_threshold=0.50,  # Generous - we don't limit drawdown
+                        random_seed=42
+                    )
 
-            if mc_validated:
-                final_results = mc_validated
+                    result.mc_passes = passes
+                    result.mc_prob_positive = mc_result.probability_positive
+                    result.mc_prob_ruin = mc_result.probability_ruin
+                    result.mc_sharpe_5th = mc_result.sharpe_5th_percentile
+                    result.mc_sequence_matters = perm_result.sequence_matters
 
-        except ImportError as e:
-            print(f"  Monte Carlo module not available: {e}")
+                    if passes:
+                        mc_validated.append(result)
+                        print(f"  [PASS] th={result.params['threshold']}, tr={result.params['trailing']}, "
+                              f"P(+)={mc_result.probability_positive:.1%}, "
+                              f"Holdout P&L={result.holdout_metrics['total_pnl']:.1f}%")
+                    else:
+                        print(f"  [FAIL] th={result.params['threshold']}, tr={result.params['trailing']}")
+
+                print(f"\n{len(mc_validated)} combos passed Monte Carlo")
+
+                if mc_validated:
+                    final_results = mc_validated
+
+            except ImportError as e:
+                print(f"  Monte Carlo module not available: {e}")
 
     # PHASE 6: Walk-Forward Validation (v7.1 NEW)
     print()
