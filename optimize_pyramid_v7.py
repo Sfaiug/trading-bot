@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """
-Pure Profit Pyramid Strategy Optimizer (v7.5)
+Pure Profit Pyramid Strategy Optimizer (v7.6)
 
-v7.5 NEW:
+v7.6 NEW:
+- Removed arbitrary combo limits from all phases
+- All combos that pass each phase are now tested in subsequent phases
+- No more truncation that could miss better strategies
+- Fixed Bonferroni calculation to use actual combo count
+
+v7.5:
 - Added progress bars to all parallel optimization phases
-- Progress visibility for Grid, Robustness, Holdout, Regime, and Monte Carlo phases
 
 v7.1 CRITICAL FIXES:
 - Fixed data leakage in robustness testing (excluded holdout data)
@@ -857,7 +862,7 @@ def run_parallel_robustness(
     """
     import time as time_module
 
-    n_items = min(30, len(results))
+    n_items = len(results)  # v7.6: No limit - test all combos
     if n_items == 0:
         return
 
@@ -949,7 +954,7 @@ def run_parallel_holdout(
     """
     import time as time_module
 
-    n_items = min(100, len(results))
+    n_items = len(results)  # v7.6: No limit - test all combos
     if n_items == 0:
         return []
 
@@ -1058,7 +1063,7 @@ def run_parallel_regime(
     """
     import time as time_module
 
-    n_items = min(10, len(results))
+    n_items = len(results)  # v7.6: No limit - test all combos
     if n_items == 0:
         return
 
@@ -1144,7 +1149,7 @@ def run_parallel_monte_carlo(
     """
     import time as time_module
 
-    n_items = min(30, len(results))
+    n_items = len(results)  # v7.6: No limit - test all combos
     if n_items == 0:
         return []
 
@@ -1615,7 +1620,7 @@ def run_optimization(
     n_workers = get_worker_count(workers)
 
     print("=" * 70)
-    print("PURE PROFIT OPTIMIZER v7.5 - 'Progress Visibility'")
+    print("PURE PROFIT OPTIMIZER v7.6 - 'No Limits'")
     print("=" * 70)
     print(f"Symbol: {symbol}")
     print(f"Days: {days}")
@@ -1934,7 +1939,7 @@ def run_optimization(
     else:
         # Sequential robustness testing
         robustness_sample_rate = max(1, thoroughness.sample_rate // thoroughness.robustness_divisor)
-        for result in working_results[:30]:
+        for result in working_results:  # v7.6: No limit - test all combos
             robustness, perturbations = calculate_robustness_score(
                 result.params, train_val_prices, funding_rates, sample_rate=robustness_sample_rate
             )
@@ -1963,7 +1968,7 @@ def run_optimization(
     print()
 
     holdout_prices = slice_prices_for_holdout(prices, holdout)
-    n_holdout_tests = min(100, len(working_results))  # Number of holdout tests for Bonferroni
+    n_holdout_tests = len(working_results)  # v7.6: Use actual count for Bonferroni
     holdout_bonferroni_alpha = FAMILY_ALPHA / n_holdout_tests if n_holdout_tests > 0 else FAMILY_ALPHA
     print(f"  Testing {n_holdout_tests} combos on holdout")
     print(f"  Bonferroni alpha for holdout: {holdout_bonferroni_alpha:.6f}")
@@ -1990,7 +1995,7 @@ def run_optimization(
     else:
         # Sequential holdout evaluation
         holdout_candidates = []
-        for result in working_results[:100]:  # Test top 100
+        for result in working_results:  # v7.6: No limit - test all combos
             # Holdout validation - sample rate depends on thoroughness level
             holdout_result = run_backtest_with_params(result.params, holdout_prices, funding_rates, sample_rate=thoroughness.holdout_sample_rate)
 
@@ -2072,7 +2077,7 @@ def run_optimization(
         )
     else:
         # Sequential regime validation
-        for result in final_results[:10]:
+        for result in final_results:  # v7.6: No limit - test all combos
             result.regime_pass = validate_regime_robustness(
                 result.params, holdout_prices, funding_rates
             )
@@ -2112,7 +2117,7 @@ def run_optimization(
                 from core.monte_carlo import run_monte_carlo_validation, format_monte_carlo_report
 
                 mc_validated = []
-                for result in final_results[:30]:
+                for result in final_results:  # v7.6: No limit - test all combos
                     # Use holdout sample rate for Monte Carlo backtest
                     holdout_result = run_backtest_with_params(result.params, holdout_prices, funding_rates, sample_rate=thoroughness.holdout_sample_rate)
                     holdout_returns = holdout_result.get('per_round_returns', [])
