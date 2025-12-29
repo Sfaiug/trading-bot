@@ -2482,6 +2482,160 @@ def select_coin_interactive() -> str:
             sys.exit(0)
 
 
+def run_single_validation(
+    symbol: str,
+    params_str: str,
+    days: int = DEFAULT_DAYS,
+    capital: float = INITIAL_CAPITAL,
+    leverage: int = LEVERAGE,
+    position_size: float = POSITION_SIZE_USDT
+) -> None:
+    """
+    Validate a single parameter combination with FULL data (100%).
+
+    This is much faster than running exhaustive mode on all 640 combos.
+
+    Args:
+        symbol: Trading pair (e.g., SOLUSDT)
+        params_str: Comma-separated params: threshold,trailing,pyramid_step,max_pyramids,vol_type,size_schedule
+        days: Days of historical data
+        capital: Starting capital
+        leverage: Leverage multiplier
+        position_size: Position size per entry
+    """
+    import time as time_module
+    from core.monte_carlo import run_monte_carlo_validation, format_monte_carlo_report
+
+    # Parse parameters
+    try:
+        parts = params_str.split(',')
+        if len(parts) != 6:
+            print(f"ERROR: Expected 6 parameters, got {len(parts)}")
+            print("Format: threshold,trailing,pyramid_step,max_pyramids,vol_type,size_schedule")
+            print("Example: 5.0,1.0,2.0,20,none,fixed")
+            return
+
+        params = {
+            'threshold': float(parts[0]),
+            'trailing': float(parts[1]),
+            'pyramid_step': float(parts[2]),
+            'max_pyramids': int(parts[3]),
+            'vol_type': parts[4].strip(),
+            'size_schedule': parts[5].strip(),
+        }
+    except Exception as e:
+        print(f"ERROR parsing parameters: {e}")
+        return
+
+    print("=" * 70)
+    print("SINGLE PARAMETER VALIDATION (100% DATA)")
+    print("=" * 70)
+    print(f"Symbol: {symbol}")
+    print(f"Days: {days}")
+    print(f"Capital: ${capital:,.0f} | Leverage: {leverage}x | Position: ${position_size:,.0f}")
+    print()
+    print("Parameters to validate:")
+    print(f"  Threshold:    {params['threshold']}%")
+    print(f"  Trailing:     {params['trailing']}%")
+    print(f"  Pyramid Step: {params['pyramid_step']}%")
+    print(f"  Max Pyramids: {params['max_pyramids']}")
+    print(f"  Vol Type:     {params['vol_type']}")
+    print(f"  Size Schedule: {params['size_schedule']}")
+    print()
+
+    # Load data
+    print("Loading tick data...")
+    from data.tick_data_fetcher import load_tick_data_cached
+    from core.funding_rates import load_funding_rates_cached
+
+    prices = load_tick_data_cached(symbol, days)
+    if prices is None or len(prices) == 0:
+        print("ERROR: Failed to load price data")
+        return
+
+    funding_rates = load_funding_rates_cached(symbol)
+    print(f"Loaded {len(prices):,} prices")
+    print()
+
+    # Set up worker globals for backtest function
+    global _worker_capital, _worker_leverage, _worker_position_size
+    _worker_capital = capital
+    _worker_leverage = leverage
+    _worker_position_size = position_size
+
+    # Run full backtest on ALL data (sample_rate=1)
+    print("Running FULL backtest (100% data)...")
+    print("This may take several minutes...")
+    start_time = time_module.time()
+
+    result = run_backtest_with_params(
+        params=params,
+        price_slice=prices,
+        funding_rates=funding_rates,
+        return_rounds=True,
+        sample_rate=1  # FULL DATA
+    )
+
+    elapsed = time_module.time() - start_time
+    print(f"Backtest completed in {elapsed:.1f}s")
+    print()
+
+    # Display results
+    print("=" * 70)
+    print("BACKTEST RESULTS (FULL DATA)")
+    print("=" * 70)
+    total_pnl = result.get('total_pnl', 0)
+    total_rounds = result.get('total_rounds', 0)
+    win_rate = result.get('win_rate', 0)
+    max_dd = result.get('max_drawdown_pct', 0)
+
+    print(f"  Total P&L:     {total_pnl:+.2f}%")
+    print(f"  Total Rounds:  {total_rounds}")
+    print(f"  Win Rate:      {win_rate:.1f}%")
+    print(f"  Max Drawdown:  {max_dd:.1f}%")
+
+    if total_rounds > 0:
+        avg_pnl = total_pnl / total_rounds
+        print(f"  Avg P&L/Round: {avg_pnl:+.3f}%")
+    print()
+
+    # Monte Carlo validation
+    per_round_returns = result.get('per_round_returns', [])
+    if len(per_round_returns) >= 30:
+        print("Running Monte Carlo validation (50,000 bootstraps)...")
+        mc_result = run_monte_carlo_validation(
+            round_returns=per_round_returns,
+            n_iterations=50000,
+            ruin_threshold=0.50
+        )
+
+        print()
+        print("=" * 70)
+        print("MONTE CARLO RESULTS")
+        print("=" * 70)
+        print(f"  P(Positive P&L):    {mc_result.probability_positive:.1%}")
+        print(f"  P(Ruin @ 50% DD):   {mc_result.probability_ruin:.1%}")
+        print(f"  5th Percentile P&L: {mc_result.pnl_5th_percentile:+.1f}%")
+        print(f"  Median P&L:         {mc_result.pnl_median:+.1f}%")
+        print(f"  95th Percentile P&L: {mc_result.pnl_95th_percentile:+.1f}%")
+        print(f"  5th Percentile Sharpe: {mc_result.sharpe_5th_percentile:.2f}")
+        print()
+
+        if mc_result.passes_validation:
+            print("  ✅ PASSES Monte Carlo validation")
+        else:
+            print("  ❌ FAILS Monte Carlo validation:")
+            for reason in mc_result.failure_reasons:
+                print(f"     - {reason}")
+    else:
+        print(f"  ⚠️  Only {len(per_round_returns)} rounds - need 30+ for Monte Carlo validation")
+
+    print()
+    print("=" * 70)
+    print("VALIDATION COMPLETE")
+    print("=" * 70)
+
+
 def select_thoroughness_interactive() -> ThoroughnessConfig:
     """Display interactive thoroughness selection menu."""
     print()
@@ -2732,6 +2886,15 @@ def main():
         default=None,
         help=f"Position size per entry in USDT. If not provided, shows interactive menu."
     )
+    parser.add_argument(
+        "--validate",
+        type=str,
+        default=None,
+        metavar="PARAMS",
+        help="Validate a specific parameter set with FULL data (100%%). "
+             "Format: threshold,trailing,pyramid_step,max_pyramids,vol_type,size_schedule. "
+             "Example: --validate 5.0,1.0,2.0,20,none,fixed"
+    )
 
     args = parser.parse_args()
 
@@ -2741,17 +2904,32 @@ def main():
 
     # Interactive trading config if not all provided via CLI
     if args.capital is None or args.leverage is None or args.position_size is None:
-        trading_config = select_trading_config_interactive()
-        # Use interactive values, but allow CLI overrides
-        if args.capital is None:
-            args.capital = trading_config['capital']
-        if args.leverage is None:
-            args.leverage = trading_config['leverage']
-        if args.position_size is None:
-            args.position_size = trading_config['position_size']
-    else:
-        # All provided via CLI - no interactive menu
-        pass
+        # For validation mode, use defaults if not specified
+        if args.validate is not None:
+            args.capital = args.capital or INITIAL_CAPITAL
+            args.leverage = args.leverage or LEVERAGE
+            args.position_size = args.position_size or POSITION_SIZE_USDT
+        else:
+            trading_config = select_trading_config_interactive()
+            # Use interactive values, but allow CLI overrides
+            if args.capital is None:
+                args.capital = trading_config['capital']
+            if args.leverage is None:
+                args.leverage = trading_config['leverage']
+            if args.position_size is None:
+                args.position_size = trading_config['position_size']
+
+    # VALIDATION MODE: Run single parameter validation and exit
+    if args.validate is not None:
+        run_single_validation(
+            symbol=args.symbol,
+            params_str=args.validate,
+            days=args.days,
+            capital=args.capital,
+            leverage=args.leverage,
+            position_size=args.position_size
+        )
+        return  # Exit after validation
 
     # Resolve thoroughness config
     if args.sample_rate is not None:
