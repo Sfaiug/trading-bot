@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """
-Pure Profit Pyramid Strategy Optimizer (v7.7)
+Pure Profit Pyramid Strategy Optimizer (v7.8)
 
-v7.7 NEW:
+v7.8 NEW:
+- Interactive mode selection: Optimize vs Validate
+- Interactive parameter input for validation mode
+- Streamlined workflow: coin → mode → config → run
+
+v7.7:
 - CLI options for --capital, --leverage, --position-size
 - Relaxed robustness score: 60% → 40% (accept sharper parameter peaks)
 - Relaxed regime threshold: 40% → 20% (allows specialized trend strategies)
@@ -2636,6 +2641,136 @@ def run_single_validation(
     print("=" * 70)
 
 
+def select_mode_interactive() -> str:
+    """Ask user whether to run full optimization or validate a single combo."""
+    print()
+    print("=" * 50)
+    print("SELECT MODE")
+    print("=" * 50)
+    print()
+    print("  1. Optimize    - Test all 640 parameter combinations")
+    print("  2. Validate    - Test a single parameter set with 100% data")
+    print()
+
+    while True:
+        try:
+            choice = input("Enter choice (1-2) [1]: ").strip()
+            if choice == "" or choice == "1":
+                return "optimize"
+            elif choice == "2":
+                return "validate"
+            else:
+                print("Invalid choice. Please enter 1 or 2.")
+        except KeyboardInterrupt:
+            print("\nCancelled.")
+            sys.exit(0)
+
+
+def select_validation_params_interactive() -> dict:
+    """Interactively prompt for each parameter value for validation."""
+    print()
+    print("=" * 50)
+    print("ENTER PARAMETERS TO VALIDATE")
+    print("=" * 50)
+    print()
+
+    params = {}
+
+    # Threshold
+    print("Threshold (% move before losing hedge closes):")
+    print("  Common values: 1.5, 3.0, 5.0, 8.0, 12.0")
+    while True:
+        try:
+            val = input("  Enter threshold [5.0]: ").strip()
+            params['threshold'] = float(val) if val else 5.0
+            break
+        except ValueError:
+            print("  Invalid number. Try again.")
+
+    # Trailing
+    print()
+    print("Trailing (% drop from max profit to exit):")
+    print("  Common values: 0.5, 1.0, 2.0, 4.0")
+    while True:
+        try:
+            val = input("  Enter trailing [1.0]: ").strip()
+            params['trailing'] = float(val) if val else 1.0
+            break
+        except ValueError:
+            print("  Invalid number. Try again.")
+
+    # Pyramid Step
+    print()
+    print("Pyramid Step (% between pyramid entries):")
+    print("  Common values: 0.5, 1.0, 2.0, 4.0")
+    while True:
+        try:
+            val = input("  Enter pyramid_step [2.0]: ").strip()
+            params['pyramid_step'] = float(val) if val else 2.0
+            break
+        except ValueError:
+            print("  Invalid number. Try again.")
+
+    # Max Pyramids
+    print()
+    print("Max Pyramids (cap on positions per round):")
+    print("  Common values: 20, 50")
+    while True:
+        try:
+            val = input("  Enter max_pyramids [20]: ").strip()
+            params['max_pyramids'] = int(val) if val else 20
+            break
+        except ValueError:
+            print("  Invalid number. Try again.")
+
+    # Vol Type
+    print()
+    print("Volatility Filter Type:")
+    print("  1. none   - No volatility filter")
+    print("  2. stddev - Standard deviation filter")
+    while True:
+        choice = input("  Enter choice (1-2) [1]: ").strip()
+        if choice == "" or choice == "1":
+            params['vol_type'] = "none"
+            break
+        elif choice == "2":
+            params['vol_type'] = "stddev"
+            break
+        else:
+            print("  Invalid choice.")
+
+    # Size Schedule
+    print()
+    print("Position Size Schedule:")
+    print("  1. fixed     - Same size for all pyramids")
+    print("  2. exp_decay - Decreasing size for later pyramids")
+    while True:
+        choice = input("  Enter choice (1-2) [1]: ").strip()
+        if choice == "" or choice == "1":
+            params['size_schedule'] = "fixed"
+            break
+        elif choice == "2":
+            params['size_schedule'] = "exp_decay"
+            break
+        else:
+            print("  Invalid choice.")
+
+    # Summary
+    print()
+    print("=" * 50)
+    print("PARAMETERS TO VALIDATE")
+    print("=" * 50)
+    print(f"  Threshold:     {params['threshold']}%")
+    print(f"  Trailing:      {params['trailing']}%")
+    print(f"  Pyramid Step:  {params['pyramid_step']}%")
+    print(f"  Max Pyramids:  {params['max_pyramids']}")
+    print(f"  Vol Type:      {params['vol_type']}")
+    print(f"  Size Schedule: {params['size_schedule']}")
+    print()
+
+    return params
+
+
 def select_thoroughness_interactive() -> ThoroughnessConfig:
     """Display interactive thoroughness selection menu."""
     print()
@@ -2901,6 +3036,18 @@ def main():
     # Interactive coin selection if no symbol provided
     if args.symbol is None:
         args.symbol = select_coin_interactive()
+
+    # Interactive mode selection if --validate not provided via CLI
+    if args.validate is None:
+        mode = select_mode_interactive()
+        if mode == "validate":
+            # Get parameters interactively
+            params = select_validation_params_interactive()
+            # Convert to the comma-separated format expected by run_single_validation
+            args.validate = (
+                f"{params['threshold']},{params['trailing']},{params['pyramid_step']},"
+                f"{params['max_pyramids']},{params['vol_type']},{params['size_schedule']}"
+            )
 
     # Interactive trading config if not all provided via CLI
     if args.capital is None or args.leverage is None or args.position_size is None:
