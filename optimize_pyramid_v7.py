@@ -775,6 +775,13 @@ def run_parallel_grid_search(
     }
 
     print(f"Starting parallel grid search with {n_workers} workers...")
+
+    # Estimate time per combo for user feedback
+    sample_rate = thoroughness.sample_rate
+    if sample_rate == 1:
+        print(f"  ⚠️  EXHAUSTIVE MODE: Each combo processes ALL data. First result may take hours.")
+        print(f"  💡 Tip: Use --thoroughness standard for faster initial screening.")
+
     start_time = time_module.time()
 
     # Graceful shutdown handler
@@ -790,9 +797,11 @@ def run_parallel_grid_search(
         signal.signal(signal.SIGINT, original_sigint)
 
         completed = 0
+        last_heartbeat = time_module.time()
 
         # Use imap_unordered for streaming results as they complete
-        for result in pool.imap_unordered(process_single_combo, work_items, chunksize=10):
+        # chunksize=1 for immediate feedback (important for slow exhaustive mode)
+        for result in pool.imap_unordered(process_single_combo, work_items, chunksize=1):
             completed += 1
 
             # Progress update using helper (updates every result for responsiveness)
@@ -2502,6 +2511,20 @@ def select_thoroughness_interactive() -> ThoroughnessConfig:
             if 0 <= idx < len(options):
                 selected_key = options[idx][0]
                 selected = THOROUGHNESS_CONFIGS[selected_key]
+
+                # Warn about exhaustive mode
+                if selected_key == 'exhaustive':
+                    print()
+                    print("  ⚠️  WARNING: Exhaustive mode takes 27-54 DAYS!")
+                    print("  Each combo processes ALL 100% of tick data.")
+                    print("  First result may not appear for several hours.")
+                    print()
+                    confirm = input("  Are you sure? (yes/no) [no]: ").strip().lower()
+                    if confirm not in ['yes', 'y']:
+                        print("  Cancelled. Please select another option.")
+                        print()
+                        continue
+
                 print(f"\nSelected: {selected.name} (~{selected.estimated_time})")
                 return selected
             else:
